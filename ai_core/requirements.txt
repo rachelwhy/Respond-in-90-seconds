@@ -1,0 +1,9 @@
+openai
+pdfplumber
+python-docx
+pandas
+openpyxl
+fastapi
+uvicorn
+python-multipart
+tabulate
