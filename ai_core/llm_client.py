@@ -71,4 +71,4 @@ class LLMClient:
         return None  # 所有重试失败
 
 # 全局单例
-client = LLMClient()
+llm_client = LLMClient()

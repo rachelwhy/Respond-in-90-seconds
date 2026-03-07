@@ -13,8 +13,12 @@ class RAGEngine:
         return chunks
 
     @staticmethod
-    def retrieve(query_keys: List[str], chunks: List[str], top_k: int = 4) -> str:
+    def retrieve(query_keys: List[str], chunks: List[str], top_k: int = 3) -> str:
         """基于语义探针的上下文召回"""
+        if not query_keys:
+            # 没有查询关键词时返回开头几个片段
+            return "\n---\n".join(chunks[:top_k])
+
         scored_chunks = []
         for chunk in chunks:
             # 统计目标字段在分片中的提及频率
@@ -25,4 +29,4 @@ class RAGEngine:
         return "\n---\n".join([c[1] for c in scored_chunks[:top_k]])
 
 
-rag = RAGEngine()
+rag_engine = RAGEngine()
