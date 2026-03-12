@@ -5,7 +5,7 @@ import re
 
 
 class QAEngine:
-    """智能问答引擎：基于RAG的问答系统"""
+    """智能问答引擎：完全独立，只做问答"""
 
     def __init__(self, confidence_threshold: float = 0.7):
         """
@@ -71,7 +71,7 @@ class QAEngine:
 
         # 对每个文档切片
         for idx, doc in enumerate(documents):
-            chunks = rag.sliding_window_chunk(doc, size=800, overlap=150)
+            chunks = rag_engine.sliding_window_chunk(doc, size=800, overlap=150)
             source = doc_sources[idx] if doc_sources and idx < len(doc_sources) else f"文档{idx + 1}"
 
             for chunk in chunks:
@@ -151,9 +151,9 @@ class QAEngine:
 问题：{question}
 
 要求：
-1. 如果文档片段中包含答案，请给出准确回答,注意紧抓问题核心，严谨推理
-2. 如果文档片段中没有足够信息，请明确说明"文档中未找到相关信息"，但整理出相关的信息，给用户适宜的引导
-3. 引用支撑答案的原文片段作为证据，并且要指出片段所在区域，如表格指出表头，如文章指出文段章节，但无需过度详细
+1. 如果文档片段中包含答案，请给出准确回答，注意紧抓文件主题，严谨推理
+2. 如果文档片段中没有足够信息，请明确说明，并归纳和问题强相关的信息，给用户适宜引导
+3. 引用支撑答案的原文片段作为证据
 4. 评估答案的可靠性（0-1之间）
 
 输出格式：
@@ -166,11 +166,10 @@ class QAEngine:
 现在开始回答：
 """
 
-        result = client.request(prompt)
+        result = llm_client.request(prompt)
 
         # 处理返回值
         if not isinstance(result, dict):
-            # 如果不是JSON，包装一下
             answer = str(result) if result else "无法生成答案"
             confidence = 0.5
             evidence = ""
@@ -198,29 +197,6 @@ class QAEngine:
             "confidence": confidence,
             "needs_human_review": confidence < self.confidence_threshold
         }
-
-    def batch_answer(self,
-                     questions: List[str],
-                     documents: List[str],
-                     doc_sources: Optional[List[str]] = None) -> List[Dict[str, Any]]:
-        """
-        批量回答问题
-        """
-        results = []
-        for q in questions:
-            result = self.answer(q, documents, doc_sources)
-            results.append(result)
-        return results
-
-    def answer_with_docs(self,
-                         question: str,
-                         docs_dict: Dict[str, str]) -> Dict[str, Any]:
-        """
-        用字典形式传入文档（文档名: 内容）
-        """
-        documents = list(docs_dict.values())
-        doc_sources = list(docs_dict.keys())
-        return self.answer(question, documents, doc_sources)
 
 
 # 全局单例
