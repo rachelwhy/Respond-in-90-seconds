@@ -15,6 +15,7 @@ A23赛题算法后端：基于RAG的异构文档理解与信息抽取系统
 
 ## 目录结构
 
+```
 Respond-in-90-seconds/
 ├── ai_core/                          # AI核心模块
 │   ├── __init__.py                    # 模块入口
@@ -43,6 +44,7 @@ Respond-in-90-seconds/
 ├── README.md                           # 项目说明
 ├── server.py                           # HTTP服务
 └── test_results.csv                    # 测试结果
+```
 
 ## 安装
 
