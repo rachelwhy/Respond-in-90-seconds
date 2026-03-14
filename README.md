@@ -1,124 +1,182 @@
-# A23 - AI Core: 异构文档理解与数据融合内核
+# Respond in 90 seconds_A23
 
-![Python Version](https://img.shields.io/badge/python-3.9+-blue.svg)
-![FastAPI](https://img.shields.io/badge/FastAPI-v0.100+-green.svg)
-![RAG](https://img.shields.io/badge/Architecture-RAG-orange.svg)
+A23赛题算法后端：基于RAG的异构文档理解与信息抽取系统
 
-## 📖 项目背景
+## 项目简介
 
-在移动办公场景下，用户经常需要从复杂的 PDF、Word 或 Excel 中提取关键信息（如合同金额、到期日期、报销项目）。本项目作为 A23 赛题的算法后端，通过 **RAG (检索增强生成)** 技术，实现了对大篇幅异构文档的精准语义理解与结构化数据映射。
+本项目作为A23赛题的算法后端，通过RAG（检索增强生成）技术，实现了对大篇幅异构文档的精准语义理解与结构化数据映射。核心功能包括：
 
+- 多格式文档解析：支持Word、Excel、Markdown、TXT等格式
+- 智能检索（RAG）：滑动窗口切片 + 向量检索 + 关键词扩展
+- 字段抽取：从证据片段中提取结构化字段
+- 规则引擎：字段标准化、格式化、兜底规则
+- 智能问答：基于文档内容的问答系统
+- 异步任务处理：支持大文件后台处理，不阻塞请求
 
+## 目录结构
 
-## ✨ 核心特性
+Respond-in-90-seconds/
+├── ai_core/                          # AI核心模块
+│   ├── __init__.py                    # 模块入口
+│   ├── core.py                         # 核心协调器
+│   ├── retriever.py                    # RAG检索模块
+│   ├── extractor.py                    # 字段抽取模块
+│   ├── processor.py                    # 规则引擎
+│   ├── llm.py                          # LLM客户端
+│   ├── loader.py                       # 文档加载器
+│   ├── qa.py                           # 问答引擎
+│   ├── prompts.py                      # prompt模板
+│   ├── config.py                       # 配置管理
+│   ├── utils.py                        # 工具函数
+│   └── exceptions.py                   # 自定义异常
+│
+├── tests/                              # 测试脚本
+│   └── batch_test.py                   # 批量测试
+├── profiles/                           # profile配置文件
+│   └── contract.json                   # 示例配置
+├── data/                               # 测试数据目录
+│   └── in/                             # 输入数据
+├── output/                             # 输出目录
+├── .env                                # 环境变量
+├── .gitignore                          # Git忽略文件
+├── requirements.txt                    # 依赖包
+├── README.md                           # 项目说明
+├── server.py                           # HTTP服务
+└── test_results.csv                    # 测试结果
 
-* **多模态解析**：内置 `UniversalLoader`，支持 PDF/Word 中的表格自动还原为 Markdown 语义。
-* **智能切片召回**：基于滑动窗口 (Sliding Window) 的文本分割，确保语义在分段时不丢失。
-* **动态模式探测**：AI 自动根据用户指令（如“帮我看看合同”）推断需要提取的字段。
-* **移动端优化**：针对 Android 低带宽环境，仅传输核心 JSON 数据，接口响应延迟低。
-* **生产级安全**：全面采用环境变量隔离敏感秘钥，符合企业级安全标准。
+## 安装
 
----
+### 环境要求
+- Python 3.8+
+- Ollama（本地模型服务）
+- 8GB+ 内存（推荐16GB）
 
-## 🛠️ 环境准备与安装
-
-### 1. 克隆项目
-```bash
-git clone [https://github.com/你的用户名/你的项目名.git](https://github.com/你的用户名/你的项目名.git)
-cd ai_core
-```
+### 1. 克隆仓库
+git clone https://github.com/rachelwhy/Respond-in-90-seconds.git
+cd Respond-in-90-seconds
 
 ### 2. 安装依赖
 
-建议使用  或  虚拟环境。`venv``conda`
-
-bash
-
-```
 pip install -r requirements.txt
-```
 
-### 3. 配置 API Key （环境注入）
+### 3. 配置Ollama
 
-本系统必须检测到环境变量  才能启动。`DASHSCOPE_API_KEY`
+## 拉取所需模型
 
-**Windows（临时注入）：**
+ollama pull qwen2.5:7b
+ollama pull nomic-embed-text
 
-DOS
+## 启动Ollama服务
 
-```
-set DASHSCOPE_API_KEY=sk-xxxx你的真实Key
-```
+ollama serve
 
-**Linux/Mac （临时注入）：**
+### 4. 配置环境变量
+创建 .env 文件：
+MODEL_BACKEND=ollama
+OLLAMA_URL=http://localhost:11434
+OLLAMA_MODEL=qwen2.5:7b
+EMBEDDING_MODEL=nomic-embed-text
 
-bash
+## 快速开始
 
-```
-export DASHSCOPE_API_KEY="sk-你的真实Key"
-```
+### 方式1：直接调用
+from ai_core import processor
 
-------
+result = processor.process(
+    file_path="data/合同.docx",
+    instruction="提取合同金额和签订日期",
+    output_format="dict"
+)
+print(result["data"])
 
-## 🚀 启动与运行
-
-启动算法后端服务器：
-
-bash
-
-```
+### 方式2：启动HTTP服务
 python server.py
-```
+访问 http://localhost:8000/docs 查看接口文档
 
-- **默认地址**：`http://0.0.0.0:8000`
-- **API 文档**： 启动后访问 查看 Swagger UI。`http://localhost:8000/docs`
+### 方式3：批量测试
+python tests/batch_test.py
 
-------
+## API接口
 
-## 📡 接口规格说明 （Android 对接参考）
+启动服务后访问：http://localhost:8000/docs
 
-### 核心接口：文档分析
+| 接口                 | 方法 | 说明             |
+| -------------------- | ---- | ---------------- |
+| /api/extract         | POST | 提交文档抽取任务 |
+| /api/ask             | POST | 提交问答任务     |
+| /api/tasks/{task_id} | GET  | 查询任务结果     |
+| /api/tasks           | GET  | 查看所有任务     |
 
-- **终点**：`/analyze`
-- **方法**：`POST`
-- **内容类型**：`multipart/form-data`
+## Profile配置示例
 
-| **参数名**    | **类型** | **必选** | **说明**                          |
-| ------------- | -------- | -------- | --------------------------------- |
-| `file`        | 二进制   | 是       | 支持，.pdf、.docx、.xlsx、.txt    |
-| `instruction` | 字符串   | 是       | 处理指令，如 "提取发票金额、税率" |
-
-### 响应示例
-
-JSON
-
-```
+profiles/contract.json：
 {
-  "success": true,
-  "payload": {
-    "data": {
-      "发票金额": "5000.00",
-      "税率": "6%"
+  "report_name": "合同信息抽取",
+  "instruction": "提取合同中的关键信息",
+  "fields": [
+    {
+      "name": "合同金额",
+      "type": "money",
+      "required": true,
+      "output_format": "cny_uppercase"
     },
-    "confidence": 0.98,
-    "source_context": "..." 
-  }
+    {
+      "name": "签订日期",
+      "type": "date",
+      "required": true,
+      "output_format": "YYYY年M月D日"
+    }
+  ]
 }
-```
 
-------
+## 测试结果（2026.03.13）
 
-## 🧩 技术架构
+| 指标        | 数值    |
+| ----------- | ------- |
+| 总文件数    | 16个    |
+| 成功率      | 100%    |
+| 平均耗时    | 11.30秒 |
+| 最快        | 0.58秒  |
+| 最慢        | 28.33秒 |
+| 超时 (>90s) | 0个     |
 
-1. **数据层**： 负责将异构文件转化为统一文本流。`document_loaders.py`
-2. **检索层**： 负责在长文本中定位相关信息片段。`rag_engine.py`
-3. **推理层**： 封装了对大模型的原子级调用与重试。`llm_client.py`
-4. **接口层**： 提供高性能的 RESTful API 供安卓调用。`server.py`
+## 常见问题
 
-------
+### Q1: 启动服务时报错“ModuleNotFoundError”
+A: 确认在项目根目录运行，或添加：
+import sys
+sys.path.insert(0, '项目绝对路径')
 
-## ⚠️ 注意事项
+### Q2: Ollama连接失败
+A: 确认Ollama服务已启动：
+ollama serve
+ollama list
 
-- **文件限制**：单个文件建议不超过 20MB，以确保移动端上传体验。
-- **并发处理**：当前版本为演示版本，生产环境建议配合 Redis 队列。
-- **隐私保护**：本系统不会永久存储用户上传的文件，处理完成后立即自动销毁缓存。
+### Q3: 内存不足
+A: 可尝试更小的模型：
+ollama pull qwen2.5:3b
+修改 .env 中的 OLLAMA_MODEL=qwen2.5:3b
+
+## 更新日志
+
+### v2.0.0 (2026.03.13)
+
+- 完成核心模块重构
+- 融合RAG检索与规则引擎
+- 支持profile配置
+- 批量测试100%通过
+- 提供完整HTTP API
+
+## 团队
+
+| 姓名   | 角色     |
+| ------ | -------- |
+| 王学涵 | 前端     |
+| 林卓均 | UI+管理  |
+| 吴启锐 | RAG检索  |
+| 诸凯杰 | 后端     |
+| 魏嘉华 | 字段抽取 |
+
+## 许可证
+
+MIT License © 2026 Respond in 90 seconds_A23 团队

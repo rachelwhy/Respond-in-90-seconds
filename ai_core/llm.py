@@ -1,43 +1,64 @@
+"""
+LLM客户端模块：封装不同后端的模型调用
+从你的代码迁移：llm_client.py 核心功能
+"""
+
 import json
 import time
 import os
 import requests
+import re
 from typing import Any, Optional
 from enum import Enum
 from dotenv import load_dotenv
-import re
 
-current_dir = os.path.dirname(os.path.abspath(__file__))
-project_root = os.path.dirname(current_dir)
-dotenv_path = os.path.join(project_root, '.env')
-load_dotenv(dotenv_path)
-print(f"📁 加载配置文件: {dotenv_path}")
+load_dotenv()
+
 
 class ModelBackend(str, Enum):
     OLLAMA = "ollama"
     OPENAI = "openai"
     DASHSCOPE = "dashscope"
 
+
 class LLMClient:
-    def __init__(self, base_url: Optional[str] = None, model: Optional[str] = None):
-        self.backend = os.getenv("MODEL_BACKEND", "ollama")
+    """
+    LLM客户端：支持Ollama、OpenAI、DashScope
+    包含JSON修复、重试机制
+    """
+
+    def __init__(self, backend: Optional[str] = None,
+                 base_url: Optional[str] = None,
+                 model: Optional[str] = None):
+        self.backend = backend or os.getenv("MODEL_BACKEND", "ollama")
         self.base_url = (base_url or os.getenv("OLLAMA_URL", "http://localhost:11434")).rstrip('/')
         self.model = model or os.getenv("OLLAMA_MODEL", "qwen2.5:7b")
         self.openai_key = os.getenv("OPENAI_API_KEY", "")
         self.dashscope_key = os.getenv("DASHSCOPE_API_KEY", "")
         print(f"🤖 LLM客户端初始化，后端: {self.backend}, 模型: {self.model}")
 
-    def request(self, prompt: str, is_json: bool = True, model: Optional[str] = None) -> Any:
+    def request(self, prompt: str, is_json: bool = True,
+                model: Optional[str] = None, timeout: int = 90) -> Any:
+        """
+        发送请求到LLM
+        参数：
+            prompt: 提示词
+            is_json: 是否期望JSON返回
+            model: 指定模型（可选）
+            timeout: 超时时间（秒）
+        """
         if self.backend == "ollama":
-            return self._request_ollama(prompt, is_json, model)
+            return self._request_ollama(prompt, is_json, model, timeout)
         elif self.backend == "openai":
             return self._request_openai(prompt, is_json, model)
         elif self.backend == "dashscope":
             return self._request_dashscope(prompt, is_json, model)
         else:
-            return self._request_ollama(prompt, is_json, model)
+            return self._request_ollama(prompt, is_json, model, timeout)
 
-    def _request_ollama(self, prompt: str, is_json: bool, model: Optional[str]) -> Any:
+    def _request_ollama(self, prompt: str, is_json: bool,
+                        model: Optional[str], timeout: int) -> Any:
+        """Ollama后端"""
         model_name = model or self.model
         url = f"{self.base_url}/api/chat"
         messages = [
@@ -50,51 +71,45 @@ class LLMClient:
             "stream": False,
             "options": {
                 "temperature": 0.1,
-                "num_predict": 8192,        # 增加输出长度
+                "num_predict": 8192,
                 "top_k": 20,
                 "top_p": 0.95,
                 "repeat_penalty": 1.1,
             }
         }
-        last_error = None
+
         for attempt in range(3):
             try:
-                # 超时设为90秒，避免频繁超时重试
-                resp = requests.post(url, json=payload, timeout=90)
+                resp = requests.post(url, json=payload, timeout=timeout)
                 resp.raise_for_status()
                 data = resp.json()
                 content = data["message"]["content"]
+
                 if is_json:
                     content = self._clean_json(content)
                     return json.loads(content)
                 return content
+
             except requests.exceptions.Timeout:
                 print(f"⏰ 请求超时 (attempt {attempt+1})")
-                last_error = "Timeout"
                 time.sleep(1 + attempt)
             except json.JSONDecodeError as e:
                 print(f"JSON解析失败 (attempt {attempt+1}): {e}")
-                # 尝试多种修复方法
-                fixed = (self._extract_first_json(content) or
-                         self._extract_last_json(content) or
-                         self._fix_json(content))
+                fixed = self._extract_json(content)
                 if fixed:
                     try:
                         return json.loads(fixed)
                     except:
                         pass
-                last_error = e
                 time.sleep(1 + attempt)
             except Exception as e:
                 print(f"请求失败 (attempt {attempt+1}): {e}")
-                last_error = e
                 time.sleep(1 + attempt)
-        return {
-            "error": f"模型调用失败: {last_error}",
-            "fields": []
-        }
+
+        return {"error": "模型调用失败", "fields": []}
 
     def _clean_json(self, content: str) -> str:
+        """清理JSON中的markdown标记"""
         content = content.strip()
         if content.startswith("```json"):
             content = content[7:]
@@ -102,9 +117,9 @@ class LLMClient:
             content = content[:-3]
         return content.strip()
 
-    def _extract_first_json(self, content: str) -> Optional[str]:
-        """提取第一个完整的JSON对象或数组"""
-        content = content.strip()
+    def _extract_json(self, content: str) -> Optional[str]:
+        """从文本中提取JSON"""
+        # 尝试提取第一个完整JSON
         stack = []
         start = -1
         for i, ch in enumerate(content):
@@ -123,47 +138,26 @@ class LLMClient:
                                 return candidate
                             except:
                                 start = -1
-        return None
 
-    def _extract_last_json(self, content: str) -> Optional[str]:
-        """尝试截取到最后一个 } 或 ]，用于处理截断情况"""
+        # 尝试截取到最后
         last_brace = content.rfind('}')
         last_bracket = content.rfind(']')
-        if last_brace == -1 and last_bracket == -1:
-            return None
-        end = max(last_brace, last_bracket) + 1
-        candidate = content[:end]
-        # 简单补全括号
-        open_braces = candidate.count('{') - candidate.count('}')
-        open_brackets = candidate.count('[') - candidate.count(']')
-        if open_braces > 0:
-            candidate += '}' * open_braces
-        if open_brackets > 0:
-            candidate += ']' * open_brackets
-        try:
-            json.loads(candidate)
-            return candidate
-        except:
-            return None
+        if last_brace != -1 or last_bracket != -1:
+            end = max(last_brace, last_bracket) + 1
+            candidate = content[:end]
+            try:
+                json.loads(candidate)
+                return candidate
+            except:
+                pass
 
-    def _fix_json(self, content: str) -> Optional[str]:
-        """补全括号（后备方案）"""
-        open_braces = content.count('{') - content.count('}')
-        open_brackets = content.count('[') - content.count(']')
-        if open_braces > 0:
-            content += '}' * open_braces
-        if open_brackets > 0:
-            content += ']' * open_brackets
-        try:
-            json.loads(content)
-            return content
-        except:
-            return None
+        return None
 
     def _request_openai(self, prompt: str, is_json: bool, model: Optional[str]) -> Any:
+        """OpenAI后端"""
         if not self.openai_key:
-            print("未配置OPENAI_API_KEY，回退到Ollama")
-            return self._request_ollama(prompt, is_json, model)
+            return self._request_ollama(prompt, is_json, model, 90)
+
         headers = {
             "Authorization": f"Bearer {self.openai_key}",
             "Content-Type": "application/json"
@@ -195,9 +189,10 @@ class LLMClient:
             return None
 
     def _request_dashscope(self, prompt: str, is_json: bool, model: Optional[str]) -> Any:
+        """DashScope后端"""
         if not self.dashscope_key:
-            print("未配置DASHSCOPE_API_KEY，回退到Ollama")
-            return self._request_ollama(prompt, is_json, model)
+            return self._request_ollama(prompt, is_json, model, 90)
+
         import dashscope
         dashscope.api_key = self.dashscope_key
         messages = [
@@ -222,4 +217,5 @@ class LLMClient:
             return None
 
 
+# 全局单例
 llm_client = LLMClient()

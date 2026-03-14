@@ -1,3 +1,6 @@
+"""
+HTTP服务模块：提供文档抽取和问答的API接口
+"""
 import os
 import shutil
 import uvicorn
@@ -7,10 +10,7 @@ from fastapi.responses import JSONResponse
 import uuid
 from typing import Dict, List, Optional
 
-# 统一导入 - 都使用小写导出名
-from .document_loaders import document_loader
-from .core_engine import core_engine
-from .qa_engine import qa_engine
+from ai_core import processor, qa_engine, document_loader
 
 app = FastAPI(title="A23 AI Core API")
 
@@ -26,25 +26,19 @@ app.add_middleware(
 task_status: Dict[str, dict] = {}
 
 
-# ==================== 文档解析工具 ====================
-
-def parse_document(file_path: str, filename: str) -> str:
-    """解析文档为文本"""
-    return document_loader.load(file_path, filename)
-
-
-# ==================== 抽取接口 ====================
+# ==================== 文档抽取接口 ====================
 
 async def process_extract_task(task_id: str, instruction: str, file_path: str, filename: str):
     """后台任务：处理文档抽取"""
     try:
         task_status[task_id] = {"status": "processing", "type": "extract"}
 
-        # 解析文档
-        text = parse_document(file_path, filename)
-
         # 调用抽取引擎
-        result = core_engine.process(text, instruction)
+        result = processor.process(
+            file_path=file_path,
+            instruction=instruction,
+            output_format="dict"
+        )
 
         task_status[task_id] = {
             "status": "completed",
@@ -93,10 +87,15 @@ async def process_qa_task(task_id: str, question: str, file_paths: List[str], fi
         doc_sources = []
 
         for path, name in zip(file_paths, file_names):
-            text = parse_document(path, name)
-            if text and not text.startswith("不支持的文件类型"):
-                documents.append(text)
-                doc_sources.append(name)
+            doc_info = document_loader.load(path, name)
+            if "error" not in doc_info:
+                if doc_info.get("type") in ["word", "markdown"]:
+                    text = "\n".join(doc_info.get("paragraphs", []))
+                else:
+                    text = doc_info.get("text", "")
+                if text:
+                    documents.append(text)
+                    doc_sources.append(name)
 
         if not documents:
             task_status[task_id] = {
@@ -142,7 +141,6 @@ async def submit_qa_task(
     file_paths = []
     file_names = []
 
-    # 保存所有上传的文件
     for file in files:
         temp_path = f"cache_qa_{task_id}_{file.filename}"
         with open(temp_path, "wb") as buffer:
@@ -156,7 +154,7 @@ async def submit_qa_task(
     return {"task_id": task_id, "type": "qa"}
 
 
-# ==================== 通用任务查询接口 ====================
+# ==================== 任务查询接口 ====================
 
 @app.get("/api/tasks/{task_id}")
 async def get_task_detail(task_id: str):
@@ -172,7 +170,7 @@ async def get_task_detail(task_id: str):
         return {"task_id": task_id, "status": "processing", "type": info.get("type")}
     elif info["status"] == "failed":
         return {"task_id": task_id, "status": "failed", "type": info.get("type"), "error": info.get("error")}
-    else:  # completed
+    else:
         return {
             "task_id": task_id,
             "status": "completed",

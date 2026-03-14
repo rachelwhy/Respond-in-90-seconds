@@ -1,0 +1,23 @@
+# 核心依赖
+numpy>=1.24.0
+requests>=2.28.0
+python-docx>=0.8.11
+pandas>=2.0.0
+openpyxl>=3.1.0
+python-dotenv>=1.0.0
+jieba>=0.42.1
+
+# API服务
+fastapi>=0.100.0
+uvicorn>=0.23.0
+python-multipart>=0.0.6
+
+# 测试工具
+tabulate>=0.9.0
+
+# 可选后端
+openai>=1.0.0
+dashscope>=1.0.0
+
+# PDF支持（如果需要）
+pdfplumber>=0.10.0

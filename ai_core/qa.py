@@ -1,11 +1,20 @@
+"""
+问答引擎模块：基于RAG的智能问答
+从你的代码迁移：qa_engine.py 核心功能
+"""
+
 from typing import List, Dict, Any, Optional, Tuple
-from .llm_client import llm_client
-from .rag_engine import rag_engine
+from .llm import llm_client
+from .retriever import retriever
+from . import prompts
 import re
 
 
 class QAEngine:
-    """智能问答引擎：完全独立，只做问答"""
+    """
+    智能问答引擎：完全独立，只做问答
+    基于RAG检索增强生成
+    """
 
     def __init__(self, confidence_threshold: float = 0.7):
         """
@@ -71,11 +80,12 @@ class QAEngine:
 
         # 对每个文档切片
         for idx, doc in enumerate(documents):
-            chunks = rag_engine.sliding_window_chunk(doc, size=800, overlap=150)
+            # 复用retriever的切片功能
+            chunks = retriever._chunk_text(doc, size=800, overlap=150)
             source = doc_sources[idx] if doc_sources and idx < len(doc_sources) else f"文档{idx + 1}"
 
             for chunk in chunks:
-                all_chunks.append(chunk)
+                all_chunks.append(chunk["text"])
                 all_sources.append(source)
 
         if not all_chunks:
@@ -166,7 +176,7 @@ class QAEngine:
 现在开始回答：
 """
 
-        result = llm_client.request(prompt)
+        result = llm_client.request(prompt, is_json=True)
 
         # 处理返回值
         if not isinstance(result, dict):

@@ -1,26 +1,33 @@
+"""
+批量测试脚本：遍历测试集，统计成功率和耗时
+"""
+import sys
 import os
+
+# 将项目根目录添加到 Python 路径中
+# 这样就能找到 ai_core 模块
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 import time
 import json
 import csv
-import sys
 from tabulate import tabulate
+from ai_core import processor
 
-sys.path.insert(0, os.path.dirname(__file__))
-
-from ai_core.core_engine import core_engine
-
-TEST_ROOT = "测试集"
-OUTPUT_FILE = "test_results.csv"
+TEST_ROOT = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "测试集")
+OUTPUT_FILE = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "test_results.csv")
 TIMEOUT_LIMIT = 90
 
 SUPPORTED_EXTS = ['.docx', '.doc', '.xlsx', '.xls', '.txt', '.md']
 
 
 def get_instruction_for_file(file_path):
+    """根据文件类型返回默认指令"""
     return "提取文档中的重要信息"
 
 
 def process_file(file_path):
+    """处理单个文件"""
     filename = os.path.basename(file_path)
     ext = os.path.splitext(filename)[1].lower()
 
@@ -31,31 +38,23 @@ def process_file(file_path):
         instruction = get_instruction_for_file(file_path)
 
         start = time.time()
-        result = core_engine.process(
+        result = processor.process(
             file_path=file_path,
             instruction=instruction,
-            template=None
+            output_format="list"
         )
         elapsed = time.time() - start
 
-        # ✅ 根据不同文件类型检查结果
         if result.get("error"):
             return None, elapsed, result["error"]
 
         file_type = result.get("file_type", "")
 
-        # Excel 文件检查 data 字段
         if file_type == "excel":
             if not result.get("data"):
                 return None, elapsed, "抽取结果为空"
-
-        # 其他文件检查 fields 字段
         elif not result.get("fields"):
             return None, elapsed, "抽取结果为空"
-
-        # Word 文件特殊处理：86秒那个虽然成功但有 JSON 解析失败
-        if file_type == "word" and elapsed > 85:
-            print(f"  ⚠️ Word 文件耗时较长，但已成功")
 
         return result, elapsed, None
 
@@ -64,6 +63,7 @@ def process_file(file_path):
 
 
 def safe_json_dumps(obj):
+    """安全地序列化JSON"""
     try:
         return json.dumps(obj, ensure_ascii=False, default=str)
     except:
@@ -71,6 +71,7 @@ def safe_json_dumps(obj):
 
 
 def main():
+    """主函数"""
     results = []
     total_files = 0
     success_files = 0
@@ -106,7 +107,6 @@ def main():
                 if elapsed > TIMEOUT_LIMIT:
                     timeout_files.append((file, elapsed))
 
-                # 显示更多信息
                 file_type = result.get("file_type", "unknown")
                 if file_type == "excel":
                     row_count = result.get("row_count", 0)
@@ -117,11 +117,13 @@ def main():
             else:
                 print(f"  ❌ 失败: {error}")
 
+    # 保存结果
     with open(OUTPUT_FILE, 'w', newline='', encoding='utf-8-sig') as f:
         writer = csv.DictWriter(f, fieldnames=["file", "status", "elapsed", "result", "error"])
         writer.writeheader()
         writer.writerows(results)
 
+    # 统计
     fail_files = total_files - success_files
     success_rate = success_files / total_files * 100 if total_files > 0 else 0
 
