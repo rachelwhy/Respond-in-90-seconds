@@ -17,8 +17,8 @@ A23赛题算法后端：基于RAG的异构文档理解与信息抽取系统
 
 ```
 Respond-in-90-seconds/
-├── ai_core/                          # AI核心模块
-│   ├── __init__.py                    # 模块入口
+├── ai_core/                            # AI核心模块
+│   ├── __init__.py                     # 模块入口
 │   ├── core.py                         # 核心协调器
 │   ├── retriever.py                    # RAG检索模块
 │   ├── extractor.py                    # 字段抽取模块
