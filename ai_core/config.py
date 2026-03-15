@@ -65,15 +65,3 @@ def get_field_config(profile: Dict, field_name: str) -> Optional[Dict]:
         if field["name"] == field_name:
             return field
     return None
-
-
-# 独立测试
-if __name__ == "__main__":
-    test_profile = {
-        "report_name": "合同信息",
-        "fields": [
-            {"name": "合同金额", "type": "money", "required": True},
-            {"name": "签订日期", "type": "date"}
-        ]
-    }
-    print("验证通过" if validate_profile(test_profile) else "验证失败")

@@ -1,7 +1,5 @@
 """
 抽取模块：基于证据片段和结构化信息提取字段
-从你的代码迁移：extraction_engine.py 核心功能
-融合魏的二次提取和缺失检测
 """
 
 from typing import List, Dict, Any, Union, Optional

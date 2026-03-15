@@ -15,10 +15,9 @@ A23赛题算法后端：基于RAG的异构文档理解与信息抽取系统
 
 ## 目录结构
 
-```
 Respond-in-90-seconds/
-├── ai_core/                            # AI核心模块
-│   ├── __init__.py                     # 模块入口
+├── ai_core/                          # AI核心模块
+│   ├── __init__.py                    # 模块入口
 │   ├── core.py                         # 核心协调器
 │   ├── retriever.py                    # RAG检索模块
 │   ├── extractor.py                    # 字段抽取模块
@@ -44,7 +43,6 @@ Respond-in-90-seconds/
 ├── README.md                           # 项目说明
 ├── server.py                           # HTTP服务
 └── test_results.csv                    # 测试结果
-```
 
 ## 安装
 
@@ -54,22 +52,18 @@ Respond-in-90-seconds/
 - 8GB+ 内存（推荐16GB）
 
 ### 1. 克隆仓库
-git clone https://github.com/rachelwhy/Respond-in-90-seconds.git
+git clone https://github.com/your-repo/Respond-in-90-seconds.git
 cd Respond-in-90-seconds
 
 ### 2. 安装依赖
-
 pip install -r requirements.txt
 
 ### 3. 配置Ollama
-
-## 拉取所需模型
-
+# 拉取所需模型
 ollama pull qwen2.5:7b
 ollama pull nomic-embed-text
 
-## 启动Ollama服务
-
+# 启动Ollama服务
 ollama serve
 
 ### 4. 配置环境变量
@@ -94,9 +88,6 @@ print(result["data"])
 ### 方式2：启动HTTP服务
 python server.py
 访问 http://localhost:8000/docs 查看接口文档
-
-### 方式3：批量测试
-python tests/batch_test.py
 
 ## API接口
 
@@ -158,16 +149,6 @@ ollama list
 A: 可尝试更小的模型：
 ollama pull qwen2.5:3b
 修改 .env 中的 OLLAMA_MODEL=qwen2.5:3b
-
-## 更新日志
-
-### v2.0.0 (2026.03.13)
-
-- 完成核心模块重构
-- 融合RAG检索与规则引擎
-- 支持profile配置
-- 批量测试100%通过
-- 提供完整HTTP API
 
 ## 团队
 

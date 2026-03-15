@@ -92,6 +92,8 @@ class LLMClient:
 
             except requests.exceptions.Timeout:
                 print(f"⏰ 请求超时 (attempt {attempt+1})")
+                if attempt == 2:  # 最后一次尝试失败
+                    return {"error": "超时", "fields": []}
                 time.sleep(1 + attempt)
             except json.JSONDecodeError as e:
                 print(f"JSON解析失败 (attempt {attempt+1}): {e}")
@@ -101,9 +103,13 @@ class LLMClient:
                         return json.loads(fixed)
                     except:
                         pass
+                if attempt == 2:
+                    return {"error": "JSON解析失败", "fields": []}
                 time.sleep(1 + attempt)
             except Exception as e:
                 print(f"请求失败 (attempt {attempt+1}): {e}")
+                if attempt == 2:
+                    return {"error": str(e), "fields": []}
                 time.sleep(1 + attempt)
 
         return {"error": "模型调用失败", "fields": []}
@@ -119,7 +125,6 @@ class LLMClient:
 
     def _extract_json(self, content: str) -> Optional[str]:
         """从文本中提取JSON"""
-        # 尝试提取第一个完整JSON
         stack = []
         start = -1
         for i, ch in enumerate(content):
@@ -139,7 +144,6 @@ class LLMClient:
                             except:
                                 start = -1
 
-        # 尝试截取到最后
         last_brace = content.rfind('}')
         last_bracket = content.rfind(']')
         if last_brace != -1 or last_bracket != -1:

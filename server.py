@@ -10,7 +10,10 @@ from fastapi.responses import JSONResponse
 import uuid
 from typing import Dict, List, Optional
 
-from ai_core import processor, qa_engine, document_loader
+from ai_core.core import processor
+from ai_core.qa import qa_engine
+from ai_core.extractor import extractor
+from ai_core.loader import document_loader
 
 app = FastAPI(title="A23 AI Core API")
 
@@ -26,18 +29,17 @@ app.add_middleware(
 task_status: Dict[str, dict] = {}
 
 
-# ==================== 文档抽取接口 ====================
+# ==================== 抽取接口 ====================
 
 async def process_extract_task(task_id: str, instruction: str, file_path: str, filename: str):
     """后台任务：处理文档抽取"""
     try:
         task_status[task_id] = {"status": "processing", "type": "extract"}
 
-        # 调用抽取引擎
         result = processor.process(
             file_path=file_path,
             instruction=instruction,
-            output_format="dict"
+            output_format="list"
         )
 
         task_status[task_id] = {
@@ -61,7 +63,7 @@ async def submit_extract_task(
     """
     文档抽取任务
     - 上传一个文件
-    - 返回结构化数据
+    - 返回结构化JSON数据
     """
     task_id = str(uuid.uuid4())
     temp_path = f"cache_extract_{task_id}_{file.filename}"
@@ -102,14 +104,13 @@ async def process_qa_task(task_id: str, question: str, file_paths: List[str], fi
                 "status": "completed",
                 "type": "qa",
                 "result": {
-                    "data": {"answer": "没有可用的文档内容"},
-                    "confidence": 0.0,
-                    "needs_human_review": False
+                    "answer": "没有可用的文档内容",
+                    "evidence": "",
+                    "sources": []
                 }
             }
             return
 
-        # 调用问答引擎
         result = qa_engine.answer(question, documents, doc_sources)
 
         task_status[task_id] = {
@@ -191,6 +192,12 @@ async def get_task_list(type: Optional[str] = None):
                 "type": info.get("type")
             })
     return {"tasks": tasks}
+
+
+@app.get("/health")
+async def health_check():
+    """健康检查接口"""
+    return {"status": "ok", "service": "A23 AI Core"}
 
 
 if __name__ == "__main__":

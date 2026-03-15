@@ -10,6 +10,9 @@ from .processor import FieldProcessor, field_processor
 from .llm import LLMClient, llm_client
 from .loader import DocumentLoader, document_loader
 from .qa import QAEngine, qa_engine
+from .intent import IntentRecognizer, intent_recognizer
+from .interactive import InteractiveDispatcher, dispatcher
+from .columnreader import ColumnReader, columnreader
 from .config import load_profile, validate_profile
 from .utils import Timer, timer
 from .exceptions import *
@@ -43,6 +46,18 @@ __all__ = [
     # 问答引擎
     'QAEngine',
     'qa_engine',
+
+    # 意图识别
+    'IntentRecognizer',
+    'intent_recognizer',
+
+    # 交互调度
+    'InteractiveDispatcher',
+    'dispatcher',
+
+    # 列名读取
+    'ColumnReader',
+    'columnreader',
 
     # 配置工具
     'load_profile',
