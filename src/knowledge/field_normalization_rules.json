@@ -1,0 +1,201 @@
+{
+  "default": {
+    "strip_whitespace": true,
+    "remove_commas": false
+  },
+  "annotation_patterns": [
+    "修正值?",
+    "预估值?",
+    "估算值?",
+    "估计值?",
+    "初步",
+    "调整后",
+    "约",
+    "大约",
+    "参考值?",
+    "注",
+    "备注",
+    "暂定",
+    "待确认",
+    "未审计",
+    "快报值?",
+    "初步统计",
+    "预测值?"
+  ],
+  "types": {
+    "numeric": {
+      "extract_number_regex": "\\d+(?:\\.\\d+)?",
+      "remove_commas": true,
+      "unit_conversions": {}
+    },
+    "number": {
+      "extract_number_regex": "-?\\d+(?:\\.\\d+)?",
+      "remove_commas": true,
+      "unit_conversions": {}
+    },
+    "percentage": {
+      "extract_number_regex": "\\d+(?:\\.\\d+)?",
+      "output_format": "{value}%"
+    },
+    "area": {
+      "extract_number_regex": "\\d+(?:\\.\\d+)?",
+      "unit_conversions": {
+        "公顷": 10000,
+        "亩": 666.67,
+        "平方千米": 1000000,
+        "km²": 1000000,
+        "km2": 1000000
+      },
+      "output_unit": "平方米"
+    },
+    "date": {
+      "normalize_separators": ["年", "月", "日", "号", "/"],
+      "output_format": "YYYY-MM-DD"
+    },
+    "money": {
+      "extract_number_regex": "\\d+(?:\\.\\d+)?",
+      "remove_commas": true,
+      "unit_conversions": {
+        "万": 10000,
+        "亿": 100000000,
+        "千": 1000,
+        "百万": 1000000
+      }
+    },
+    "phone": {
+      "keep_digits_only": true
+    },
+    "speed": {
+      "extract_number_regex": "\\d+(?:\\.\\d+)?",
+      "unit_conversions": {
+        "千米/小时": 1,
+        "km/h": 1,
+        "m/s": 3.6
+      },
+      "output_unit": "千米/小时"
+    },
+    "weight": {
+      "extract_number_regex": "\\d+(?:\\.\\d+)?",
+      "unit_conversions": {
+        "吨": 1000000,
+        "千克": 1000,
+        "kg": 1000,
+        "g": 1
+      },
+      "output_unit": "克"
+    }
+  },
+  "fields": {
+    "GDP总量": {
+      "type": "money",
+      "extract_number_regex": "-?\\d+(?:\\.\\d+)?",
+      "remove_commas": true
+    },
+    "人均GDP": {
+      "type": "number"
+    },
+    "人口": {
+      "type": "number"
+    },
+    "面积": {
+      "type": "area"
+    },
+    "收入": {
+      "type": "money",
+      "extract_number_regex": "-?\\d+(?:\\.\\d+)?",
+      "remove_commas": true
+    },
+    "一般公共预算收入（亿元）": {
+      "type": "money",
+      "extract_number_regex": "-?\\d+(?:\\.\\d+)?",
+      "remove_commas": true
+    },
+    "支出": {
+      "type": "money",
+      "extract_number_regex": "-?\\d+(?:\\.\\d+)?",
+      "remove_commas": true
+    },
+    "税收": {
+      "type": "money",
+      "extract_number_regex": "-?\\d+(?:\\.\\d+)?",
+      "remove_commas": true
+    },
+    "金额": {
+      "type": "money",
+      "extract_number_regex": "-?\\d+(?:\\.\\d+)?",
+      "remove_commas": true
+    },
+    "数量": {
+      "type": "number"
+    },
+    "增长率": {
+      "type": "percentage"
+    },
+    "百分比": {
+      "type": "percentage"
+    },
+    "日期": {
+      "type": "date"
+    },
+    "年份": {
+      "type": "date"
+    },
+    "联系电话": {
+      "type": "phone"
+    },
+    "排名": {
+      "type": "number"
+    },
+    "序号": {
+      "type": "number"
+    },
+    "年龄": {
+      "type": "number"
+    },
+    "经度": {
+      "type": "number"
+    },
+    "纬度": {
+      "type": "number"
+    },
+    "海拔": {
+      "type": "number"
+    },
+    "PM2.5监测值": {
+      "type": "number",
+      "extract_number_regex": "\\d+(?:\\.\\d+)?",
+      "remove_commas": true
+    },
+    "PM10监测值": {
+      "type": "number",
+      "extract_number_regex": "\\d+(?:\\.\\d+)?",
+      "remove_commas": true
+    },
+    "空气质量指数": {
+      "type": "number",
+      "extract_number_regex": "\\d+(?:\\.\\d+)?",
+      "remove_commas": true
+    },
+    "温度": {
+      "type": "number",
+      "extract_number_regex": "-?\\d+(?:\\.\\d+)?",
+      "remove_commas": true
+    },
+    "湿度": {
+      "type": "percentage"
+    },
+    "风速": {
+      "type": "number",
+      "extract_number_regex": "\\d+(?:\\.\\d+)?",
+      "remove_commas": true
+    },
+    "降水量": {
+      "type": "number",
+      "extract_number_regex": "\\d+(?:\\.\\d+)?",
+      "remove_commas": true
+    },
+    "监测值": {
+      "type": "number"
+    }
+  }
+}

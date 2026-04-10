@@ -1,27 +1,55 @@
-# 核心依赖
-numpy>=1.24.0
-requests>=2.28.0
-python-docx>=0.8.11
-python-dotenv>=1.0.0
-jieba>=0.42.1
-pandas>=1.5.0
-openpyxl>=3.1.0
+# 核心依赖（版本锁定）
+fastapi==0.115.0
+uvicorn==0.30.0
+openpyxl==3.1.0
+python-docx==1.1.0
+requests==2.31.0
+rapidfuzz==3.9.0
+openai==1.0.0
+python-multipart==0.0.9
+python-dotenv==1.0.0
+bcrypt==4.0.1
+passlib[bcrypt]==1.7.4
 
-# API服务
-fastapi>=0.100.0
-uvicorn>=0.23.0
-python-multipart>=0.0.6
+# 文本处理
+numpy==1.24.0
+jieba==0.42.1
 
-# 测试工具
-tabulate>=0.9.0
+# 图片处理与OCR
+Pillow==10.0.0
+opencv-python==4.8.0
+pytesseract==0.3.10
+pdf2image==1.16.3
 
-# 可选后端
-openai>=1.0.0
-dashscope>=1.0.0
+# 云OCR SDK（可选，用于混合方案）
+# baidu-aip==4.16.6  # 百度OCR
+# tencentcloud-sdk-python==3.0.0  # 腾讯云OCR
 
-# PDF支持
-pdfplumber>=0.10.0
+# 系统依赖说明：
+# 1. Tesseract OCR引擎：需要单独安装并添加到PATH
+#    Windows: 下载安装包 https://github.com/UB-Mannheim/tesseract/wiki
+#    Linux: sudo apt-get install tesseract-ocr tesseract-ocr-chi-sim
+#    macOS: brew install tesseract
+# 2. Poppler工具：用于PDF转图片
+#    Windows: 下载安装包 https://github.com/oschwartz10612/poppler-windows/releases
+#    Linux: sudo apt-get install poppler-utils
+#    macOS: brew install poppler
 
-# 开发工具
-pytest>=7.0.0
-pytest-cov>=4.0.0
+# 新增依赖：Docling + LangExtract 重构
+docling>=2.0.0
+langextract>=0.1.0
+diskcache>=5.6.3
+prometheus-client>=0.20.0
+
+# 语义相似度计算（可选）
+sentence-transformers>=2.2.0
+
+# 数据库（MySQL 入库）
+pymysql>=1.1.0
+
+# LangChain RAG 集成（可选，需要单独安装）
+# 安装命令：pip install langchain langchain-community chromadb
+# 安装后，qna_service.py 将自动切换到 LangChain ConversationalRetrievalChain
+# langchain>=0.2.0
+# langchain-community>=0.2.0
+# chromadb>=0.5.0

@@ -4,89 +4,139 @@ A23赛题算法后端：基于RAG的异构文档理解与信息抽取系统
 
 ## 项目简介
 
-本项目作为A23赛题的算法后端，通过RAG（检索增强生成）技术，实现了对大篇幅异构文档的精准语义理解与结构化数据映射。核心功能包括：
+本项目作为A23赛题的算法后端，通过混合策略（规则预抽取+AI模型验证）实现了对大篇幅异构文档的精准语义理解与结构化数据映射。核心功能包括：
 
-- 多格式文档解析：支持Word、Excel、Markdown、TXT等格式
-- 智能检索（RAG）：滑动窗口切片 + 向量检索 + 关键词扩展
-- 字段抽取：从证据片段中提取结构化字段
-- 规则引擎：字段标准化、格式化、兜底规则
-- 智能问答：基于文档内容的问答系统
-- 异步任务处理：支持大文件后台处理，不阻塞请求
+- **多格式文档解析**：支持Word、Excel、Markdown、TXT、PDF、图像（OCR）等多种格式
+- **语义分块优先**：基于Docling的语义分块，保持文档结构完整性，支持合并单元格处理
+- **混合抽取策略**：规则预抽取 + AI模型验证，兼顾准确性与语义理解
+- **可配置后处理**：通用字段归一化框架，支持JSON配置的规则链
+- **智能记录合并**：基于关键字段的记录去重与融合
+- **多模型支持**：Ollama本地模型、DeepSeek API、OpenAI兼容API、Qwen等
+- **RAG集成**：可选LangChain集成，自动降级到手写RAG
+- **工程鲁棒性**：总超时控制、持久化缓存、任务状态管理、优雅降级
 
 ## 目录结构
 
 Respond-in-90-seconds/
-├── ai_core/                          # AI核心模块
-│   ├── __init__.py                    # 模块入口
-│   ├── core.py                         # 核心协调器
-│   ├── retriever.py                    # RAG检索模块
-│   ├── extractor.py                    # 字段抽取模块
-│   ├── processor.py                    # 规则引擎
-│   ├── llm.py                          # LLM客户端
-│   ├── loader.py                       # 文档加载器
-│   ├── qa.py                           # 问答引擎
-│   ├── prompts.py                      # prompt模板
-│   ├── config.py                       # 配置管理
-│   ├── utils.py                        # 工具函数
-│   └── exceptions.py                   # 自定义异常
-│
-├── tests/                              # 测试脚本
-│   └── batch_test.py                   # 批量测试
-├── profiles/                           # profile配置文件
-│   └── contract.json                   # 示例配置
-├── data/                               # 测试数据目录
-│   └── in/                             # 输入数据
-├── output/                             # 输出目录
-├── .env                                # 环境变量
-├── .gitignore                          # Git忽略文件
-├── requirements.txt                    # 依赖包
-├── README.md                           # 项目说明
-├── server.py                           # HTTP服务
-└── test_results.csv                    # 测试结果
+├── src/                    # 源代码
+│   ├── algorithm/         # 算法接口层
+│   ├── pipeline/          # 流程编排器
+│   ├── extractors/        # 字段抽取器
+│   ├── engine/           # 引擎层（模型、文档、检索）
+│   ├── parsers/          # 多格式文档解析器
+│   ├── knowledge/        # 领域知识库
+│   ├── config.py         # 配置管理
+│   └── runtime_config.py # 运行时配置
+├── tests/                # 测试用例
+├── scripts/             # 工具脚本
+├── profiles/            # 模板配置文件
+├── storage/             # 上传文件存储
+├── requirements.txt     # Python依赖
+├── main.py             # 命令行入口
+├── api_server.py       # HTTP API入口
+├── CLAUDE.md           # Claude代码助手指南
+├── HOW_TO_USE_BATCH.md # 批量使用指南
+├── HTTP_API_USAGE.md   # HTTP API使用文档
+├── install_windows_dependencies.bat  # Windows一键安装脚本
+└── start_api_windows.bat             # Windows启动脚本
 
 ## 安装
 
 ### 环境要求
-- Python 3.8+
-- Ollama（本地模型服务）
+- Python 3.11+
+- Ollama（可选，用于本地模型服务）
 - 8GB+ 内存（推荐16GB）
 
 ### 1. 克隆仓库
-git clone https://github.com/your-repo/Respond-in-90-seconds.git
+```bash
+git clone https://github.com/rachelwhy/Respond-in-90-seconds.git
 cd Respond-in-90-seconds
+```
 
 ### 2. 安装依赖
+```bash
+# Windows一键安装
+install_windows_dependencies.bat
+
+# 手动安装
+python -m venv .venv
+.venv\Scripts\activate        # Windows
+source .venv/bin/activate     # Linux/macOS
 pip install -r requirements.txt
 
-### 3. 配置Ollama
-# 拉取所需模型
+# 可选RAG集成（LangChain）
+pip install langchain langchain-community chromadb
+
+# OCR系统依赖（需要单独安装）
+# 1. Tesseract OCR: https://github.com/UB-Mannheim/tesseract/wiki
+# 2. Poppler工具（PDF转图像）: https://github.com/oschwartz10612/poppler-windows
+```
+
+### 3. 配置模型
+创建 `.env` 文件（参考 `.env.example`）：
+
+```ini
+# DeepSeek API配置
+A23_MODEL_TYPE=deepseek
+A23_DEEPSEEK_BASE_URL=https://api.deepseek.com/v1
+A23_DEEPSEEK_API_KEY=sk-your-api-key-here
+A23_DEEPSEEK_MODEL=deepseek-chat
+
+# Ollama配置
+A23_MODEL_TYPE=ollama
+A23_OLLAMA_MODEL=qwen2.5:7b
+
+# 通用配置
+A23_TARGET_LIMIT_SECONDS=40
+A23_FUZZY_THRESHOLD=75
+A23_NORMALIZATION_CONFIG=src/knowledge/field_normalization_rules.json
+A23_ENABLE_OCR=false
+```
+
+### 4. 准备模型（选择一种）
+```bash
+# Ollama本地模型
 ollama pull qwen2.5:7b
-ollama pull nomic-embed-text
 
-# 启动Ollama服务
-ollama serve
-
-### 4. 配置环境变量
-创建 .env 文件：
-MODEL_BACKEND=ollama
-OLLAMA_URL=http://localhost:11434
-OLLAMA_MODEL=qwen2.5:7b
-EMBEDDING_MODEL=nomic-embed-text
+# 或使用DeepSeek API（需配置API密钥）
+# 无需本地模型
+```
 
 ## 快速开始
 
-### 方式1：直接调用
-from ai_core import processor
+### 方式1：命令行处理
+```bash
+# 智能抽取模式（推荐）
+python main.py \
+  --template "data/template/generic_template.xlsx" \
+  --input-dir "test/inputs/Excel/2025山东省环境空气质量监测数据信息.xlsx" \
+  --output-dir "test/results/output" \
+  --overwrite-output
 
-result = processor.process(
-    file_path="data/合同.docx",
-    instruction="提取合同金额和签订日期",
-    output_format="dict"
-)
-print(result["data"])
+# 纯规则抽取模式
+python main.py --llm-mode off ...
+
+# 补充抽取模式（规则预抽取 + AI补充缺失字段）
+python main.py --llm-mode supplement ...
+
+# 完整AI抽取模式（默认，Docling语义分块 + LLM）
+python main.py --llm-mode full ...
+
+# 控制语义分块处理数量
+python main.py --max-chunks 100 ...
+
+# 总超时控制（3分钟）
+python main.py --total-timeout 180 ...
+```
 
 ### 方式2：启动HTTP服务
-python server.py
+```bash
+# Windows
+start_api_windows.bat
+
+# 手动启动
+uvicorn api_server:app --host 0.0.0.0 --port 8000
+```
 访问 http://localhost:8000/docs 查看接口文档
 
 ## API接口
@@ -99,10 +149,14 @@ python server.py
 | /api/ask             | POST | 提交问答任务     |
 | /api/tasks/{task_id} | GET  | 查询任务结果     |
 | /api/tasks           | GET  | 查看所有任务     |
+| /api/health          | GET  | 健康检查         |
+
+详细API文档请参考 [HTTP_API_USAGE.md](HTTP_API_USAGE.md)
 
 ## Profile配置示例
 
 profiles/contract.json：
+```json
 {
   "report_name": "合同信息抽取",
   "instruction": "提取合同中的关键信息",
@@ -119,10 +173,26 @@ profiles/contract.json：
       "required": true,
       "output_format": "YYYY年M月D日"
     }
+  ],
+  "dedup_key_fields": ["合同编号", "签订日期"],
+  "prefer_non_empty": true
+}
+```
+
+系统支持可配置的字段归一化规则，配置文件位于 `src/knowledge/field_normalization_rules.json`：
+```json
+{
+  "rules": [
+    {
+      "field_name": "增长率",
+      "type": "percentage",
+      "operations": ["strip_percent", "to_float", "round_decimal:2"]
+    }
   ]
 }
+```
 
-## 测试结果（2026.03.13）
+## 测试结果（2026.04.10）
 
 | 指标        | 数值    |
 | ----------- | ------- |
@@ -137,18 +207,40 @@ profiles/contract.json：
 
 ### Q1: 启动服务时报错“ModuleNotFoundError”
 A: 确认在项目根目录运行，或添加：
+```python
 import sys
 sys.path.insert(0, '项目绝对路径')
+```
 
 ### Q2: Ollama连接失败
 A: 确认Ollama服务已启动：
+```bash
 ollama serve
 ollama list
+```
 
 ### Q3: 内存不足
 A: 可尝试更小的模型：
+```bash
 ollama pull qwen2.5:3b
 修改 .env 中的 OLLAMA_MODEL=qwen2.5:3b
+```
+
+### Q4: DeepSeek API调用失败
+A: 检查API密钥是否正确，网络是否可访问DeepSeek API。
+
+### Q5: OCR功能无法使用
+A: 确认已安装Tesseract和Poppler，并添加到系统PATH。
+
+## 架构升级说明（v2.0）
+
+系统已完成从"低层次文本切片 + 硬编码后处理"到"深度Docling语义结构 + 可配置通用后处理 + 工程鲁棒性"的架构升级，主要改进包括：
+
+1. **语义理解增强**: Docling语义分块，合并单元格处理，智能记录合并
+2. **可配置后处理框架**: FieldNormalizer通用字段归一化框架
+3. **工程鲁棒性提升**: 总超时控制，持久化存储，任务状态管理
+4. **参数体系优化**: `--llm-mode`参数替代旧的`--use-rules-only`
+5. **向后兼容性**: 兼容现有API接口和命令行参数
 
 ## 团队
 
