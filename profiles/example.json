@@ -1,0 +1,42 @@
+{
+  "report_name": "通用文档信息抽取",
+  "instruction": "从文档中提取关键信息字段",
+  "fields": [
+    {
+      "name": "文档标题",
+      "type": "text",
+      "required": true,
+      "description": "文档的标题或名称"
+    },
+    {
+      "name": "发布日期",
+      "type": "date",
+      "required": true,
+      "output_format": "YYYY年M月D日",
+      "description": "文档发布的日期"
+    },
+    {
+      "name": "金额",
+      "type": "money",
+      "required": false,
+      "output_format": "cny_uppercase",
+      "description": "涉及到的金额数字"
+    },
+    {
+      "name": "增长率",
+      "type": "percentage",
+      "required": false,
+      "output_format": "percent_with_two_decimals",
+      "description": "百分比增长率"
+    },
+    {
+      "name": "联系人",
+      "type": "text",
+      "required": false,
+      "description": "相关联系人信息"
+    }
+  ],
+  "dedup_key_fields": ["文档标题", "发布日期"],
+  "prefer_non_empty": true,
+  "notes": "这是一个示例配置文件，用户可根据实际需求修改字段定义"
+}
