@@ -35,9 +35,30 @@ from .base import BaseParser
 
 logger = logging.getLogger(__name__)
 
-# OCR 开关（通过环境变量控制）
-import os
-ENABLE_OCR = os.environ.get("A23_ENABLE_OCR", "false").lower() == "true"
+# OCR 开关 - 简化版本（使用环境变量和config.py）
+def _get_enable_ocr() -> bool:
+    """获取OCR开关配置，使用环境变量或config.py"""
+    try:
+        import src.config as config_module
+        if hasattr(config_module, "ENABLE_OCR"):
+            return config_module.ENABLE_OCR
+    except ImportError:
+        pass
+
+    import os
+    # 尝试带A23_前缀
+    env_value = os.environ.get("A23_ENABLE_OCR")
+    if env_value is not None:
+        return env_value.lower() in ("true", "1", "yes", "on", "y")
+
+    # 尝试不带前缀
+    env_value = os.environ.get("ENABLE_OCR")
+    if env_value is not None:
+        return env_value.lower() in ("true", "1", "yes", "on", "y")
+
+    return False
+
+ENABLE_OCR = _get_enable_ocr()
 
 
 def _build_converter(enable_ocr: bool = False):

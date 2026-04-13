@@ -27,7 +27,13 @@ def collect_input_bundle(input_dir: str) -> Dict[str, Any]:
     documents = []
     text_parts = []
 
-    for f in sorted(input_path.iterdir()):
+    # 兼容：input_dir 既可以是目录也可以是单文件
+    if input_path.is_file():
+        files = [input_path]
+    else:
+        files = sorted(input_path.iterdir())
+
+    for f in files:
         if not f.is_file():
             continue
         if f.suffix.lower() not in SUPPORTED_SUFFIXES:

@@ -267,7 +267,7 @@ def _default_profile(template_path: Optional[str]) -> dict:
 
 def generate_profile_from_document(
     document_text: str,
-    max_sample: int = 3000,
+    max_sample: int = 6000,
 ) -> dict:
     """从文档内容自动推断最佳表格结构（无模板、无用户指令时使用）
 
@@ -282,63 +282,85 @@ def generate_profile_from_document(
         - "structured_single": 可制表（单条记录）
         - "unstructured_qa": 杂乱文档，仅做 QA 入库
     """
-    sample = document_text[:max_sample] if document_text else ""
+    # 使用智能采样（15%：首部6% + 中部5% + 尾部4%）
+    sample = _smart_sample_document(document_text) if document_text else ""
     if not sample.strip():
         return _default_profile(None)
 
-    prompt = f"""你是一个文档结构分析专家。请分析以下文档内容，判断其结构类型并生成最优的数据提取配置。
+    prompt = f"""分析以下文档样本，生成Profile和示例。
 
-【文档内容样本】
+【文档样本】
 {sample}
 
-请完成以下分析：
+【任务】
+1. 找出文档中每一个有具体数值的指标，每个指标作为一个字段
+2. 为每个字段标注类型和单位（类型根据数值特征自动判断）
+3. 根据这些字段，从样本中提取一个真实示例记录
 
-1. **文档类型判断**（三选一）：
-   - "structured_table"：文档包含多个同类实体/条目（如城市列表、产品清单、人员名录、统计数据表），每个实体有相似的属性字段，适合提取为多行表格
-   - "structured_single"：文档是单一主题（如一份合同、一篇报告、一个项目介绍），包含若干关键信息字段，适合提取为单条记录
-   - "unstructured_qa"：文档内容杂乱或叙述性强，无法归纳为固定字段的结构化数据，仅适合作为问答知识库
-
-2. **若为 structured_table 或 structured_single**，请设计最优的提取字段列表：
-   - 字段名简洁明确（如"城市名称"、"GDP总量"、"常住人口"）
-   - 字段类型标注（text/number/date/money/percentage）
-   - 对于数值型字段，标注单位（如"亿元"、"万人"）
-   - 字段数量适中：表格模式 5-15 个字段，单记录模式 3-10 个字段
-   - 不要太简陋（至少覆盖文档中出现的主要信息维度）
-   - 也不要过度拆分（合并可以归类的信息）
-
-输出严格JSON格式：
+【输出格式（严格JSON）】
 {{
-    "doc_type": "structured_table" 或 "structured_single" 或 "unstructured_qa",
-    "task_mode": "table_records" 或 "single_record",
     "fields": [
-        {{"name": "字段名", "type": "text/number/date", "unit": "单位（可选）"}}
+        {{"name": "指标名称", "type": "类型", "unit": "单位"}}
     ],
-    "instruction": "一句话描述提取任务（如：从文档中逐条提取各城市的经济指标数据）",
-    "estimated_record_count": 数字（预估记录条数，仅 table_records 模式需要）
+    "example": {{
+        "text": "从样本中选取的实际文本片段",
+        "attributes": {{"指标名称": "实际值"}}
+    }}
 }}
 
-只输出JSON，不要其他文字："""
+只输出JSON，不要有其他内容。"""
 
     try:
         from src.adapters.model_client import call_model
-        raw = call_model(prompt)
+        raw = call_model(prompt, temperature=0.1, timeout=30)
 
-        # 解析LLM输出
+        # 兼容 call_model 返回的各种类型
+        # 1. 如果是列表，取第一个元素（假设列表包含字典）
+        if isinstance(raw, list):
+            raw = raw[0] if raw else {}
+
+        # 2. 如果是字符串，尝试提取 JSON 对象
         if isinstance(raw, str):
-            import re as _re
-            match = _re.search(r'\{.*\}', raw, _re.DOTALL)
+            import re
+            match = re.search(r'\{.*\}', raw, re.DOTALL)
             if match:
-                raw = json.loads(match.group())
+                try:
+                    raw = json.loads(match.group())
+                except json.JSONDecodeError:
+                    # 如果提取的 JSON 解析失败，尝试修复常见问题
+                    try:
+                        from src.adapters.model_client import _fix_json_common_issues
+                        fixed = _fix_json_common_issues(match.group())
+                        raw = json.loads(fixed)
+                    except:
+                        raw = {}
             else:
-                raise ValueError("LLM 输出中未找到 JSON")
+                # 没有找到 JSON 对象，设为空字典
+                raw = {}
 
+        # 3. 确保 raw 是字典，否则设为空字典
         if not isinstance(raw, dict):
-            raise ValueError(f"LLM 输出格式异常: {type(raw)}")
+            raw = {}
 
-        doc_type = raw.get("doc_type", "unstructured_qa")
-        task_mode = raw.get("task_mode", "single_record")
+        # 新格式：提取fields和example
         fields_raw = raw.get("fields", [])
-        instruction = raw.get("instruction", "从文档中提取关键信息")
+        example_data = raw.get("example", {})
+
+        # 推断文档类型和任务模式
+        # 默认假设为结构化单记录文档
+        doc_type = "structured_single"
+        task_mode = "single_record"
+        instruction = "从文档中提取关键信息"
+
+        # 简单启发式：如果字段数量多且包含常见表格字段，可能为表格
+        if len(fields_raw) > 8:
+            # 检查是否有典型表格字段
+            table_keywords = {"序号", "编号", "名称", "城市", "地区", "项目", "产品"}
+            field_names = [str(f.get("name", "")).lower() for f in fields_raw if isinstance(f, dict)]
+            if any(keyword in " ".join(field_names) for keyword in table_keywords):
+                doc_type = "structured_table"
+                task_mode = "table_records"
+                instruction = "从文档中逐条提取记录"
 
         # QA 模式：返回最小化 profile + 标记
         if doc_type == "unstructured_qa":
@@ -392,6 +414,19 @@ def generate_profile_from_document(
         if not fields:
             raise ValueError("LLM 未生成有效字段")
 
+        # 保存example数据到profile中
+        example_attrs = {}
+        example_text = ""
+        if example_data and isinstance(example_data, dict):
+            example_attrs = example_data.get("attributes", {})
+            example_text = example_data.get("text", "")
+            # 确保attributes是字典
+            if not isinstance(example_attrs, dict):
+                example_attrs = {}
+            # 如果example_text为空但attributes有值，生成简单文本
+            if not example_text and example_attrs:
+                example_text = "示例记录: " + ", ".join([f"{k}: {v}" for k, v in example_attrs.items()])
+
         profile = {
             "report_name": "auto_generated",
             "template_path": "",
@@ -400,6 +435,8 @@ def generate_profile_from_document(
             "template_mode": "generic",
             "_doc_type": doc_type,
             "fields": fields,
+            "_example": example_attrs,
+            "_example_text": example_text,
         }
         if dedup_key_fields:
             profile["dedup_key_fields"] = dedup_key_fields
@@ -413,8 +450,8 @@ def generate_profile_from_document(
 
     except Exception as e:
         logger.warning(f"文档自动分析失败: {e}，使用默认 profile")
-        # 回退：尝试用简单启发式分析
-        return _heuristic_profile_from_text(sample)
+        # 回退：使用规则生成函数
+        return _rule_generate_profile_and_example(sample)
 
 
 def _heuristic_profile_from_text(text: str) -> dict:
@@ -559,3 +596,199 @@ def _read_template_text(template_path: str) -> str:
         except Exception as e:
             return f"（Word 解析失败: {e}）"
     return f"（不支持格式: {ext}）"
+
+
+# ── 智能采样函数 ──────────────────────────────────────────────────────────────
+
+def _smart_sample_document(document_text: str, total_ratio: float = 0.15) -> str:
+    """智能采样文档内容，总计15%：首部6% + 中部5% + 尾部4%
+
+    Args:
+        document_text: 完整文档文本
+        total_ratio: 总采样比例，默认0.15（15%）
+
+    Returns:
+        采样后的文本
+    """
+    if len(document_text) < 5000:
+        return document_text  # 短文档使用全文
+
+    # 1. 按段落分割
+    paragraphs = re.split(r'\n\s*\n|\r\n\s*\r\n', document_text)
+    if len(paragraphs) <= 1:
+        paragraphs = document_text.split('\n')
+
+    # 2. 计算目标字符数
+    target_chars = int(len(document_text) * total_ratio)
+    head_ratio, middle_ratio, tail_ratio = 0.06, 0.05, 0.04
+
+    # 3. 采样策略
+    sampled_paragraphs = []
+
+    # 首部6%：从开头取段落
+    head_chars = int(len(document_text) * head_ratio)
+    head_paras = _collect_paragraphs_up_to_chars(paragraphs, head_chars)
+    sampled_paragraphs.extend(head_paras)
+
+    # 尾部4%：从结尾取段落
+    tail_chars = int(len(document_text) * tail_ratio)
+    tail_paras = _collect_paragraphs_from_end_up_to_chars(paragraphs, tail_chars)
+    sampled_paragraphs.extend(tail_paras)
+
+    # 中部5%：优先选择包含数字的段落
+    middle_chars = int(len(document_text) * middle_ratio)
+    middle_indices = range(len(paragraphs) // 4, 3 * len(paragraphs) // 4)
+    middle_paras = []
+
+    # 优先选择包含数字的段落
+    numeric_paras = []
+    for idx in middle_indices:
+        if idx < len(paragraphs) and re.search(r'\d+', paragraphs[idx]):
+            numeric_paras.append(paragraphs[idx])
+
+    # 如果包含数字的段落不足，补充其他段落
+    if len(numeric_paras) < 3:  # 至少3段
+        other_paras = []
+        for idx in middle_indices:
+            if idx < len(paragraphs):
+                para = paragraphs[idx]
+                if para not in numeric_paras:
+                    other_paras.append(para)
+        numeric_paras.extend(other_paras[:5])  # 最多补充5段
+
+    middle_paras = _collect_paragraphs_up_to_chars(numeric_paras, middle_chars)
+    sampled_paragraphs.extend(middle_paras)
+
+    # 4. 去重并保持顺序
+    unique_paras = []
+    seen = set()
+    for para in sampled_paragraphs:
+        if para not in seen and para.strip():
+            unique_paras.append(para)
+            seen.add(para)
+
+    # 5. 回退：如果采样结果为空，取前15%
+    if not unique_paras:
+        fallback_chars = int(len(document_text) * 0.15)
+        return document_text[:fallback_chars]
+
+    return "\n\n".join(unique_paras)
+
+
+def _collect_paragraphs_up_to_chars(paragraphs: list, max_chars: int) -> list:
+    """按顺序收集段落，直到达到目标字符数
+
+    Args:
+        paragraphs: 段落列表
+        max_chars: 最大字符数
+
+    Returns:
+        收集的段落列表
+    """
+    result = []
+    current_chars = 0
+    for para in paragraphs:
+        if current_chars + len(para) <= max_chars:
+            result.append(para)
+            current_chars += len(para)
+        else:
+            break
+    return result
+
+
+def _collect_paragraphs_from_end_up_to_chars(paragraphs: list, max_chars: int) -> list:
+    """从末尾收集段落，直到达到目标字符数
+
+    Args:
+        paragraphs: 段落列表
+        max_chars: 最大字符数
+
+    Returns:
+        收集的段落列表（保持原文顺序）
+    """
+    result = []
+    current_chars = 0
+    for para in reversed(paragraphs):
+        if current_chars + len(para) <= max_chars:
+            result.insert(0, para)  # 保持原文顺序
+            current_chars += len(para)
+        else:
+            break
+    return result
+
+
+def _rule_generate_profile_and_example(sample_text: str) -> dict:
+    """LLM失败时的规则回退函数
+
+    Args:
+        sample_text: 采样文本
+
+    Returns:
+        包含fields和example的profile字典
+    """
+    # 正则提取 数字+单位
+    pattern = r'(\d[\d,.]*)\s*([元%人万吨公里小时]*)'
+    matches = re.findall(pattern, sample_text)
+
+    fields = []
+    example_attrs = {}
+
+    for i, (num, unit) in enumerate(matches[:10]):  # 最多10个字段
+        field_name = f"指标{i+1}"
+        field_type = "text"
+
+        if unit:
+            if unit == "元":
+                field_type = "money"
+            elif unit == "%":
+                field_type = "percentage"
+            elif unit in ("人", "万人"):
+                field_type = "population"
+            elif unit in ("吨", "万吨"):
+                field_type = "weight"
+            else:
+                field_type = "number"
+
+        fields.append({
+            "name": field_name,
+            "type": field_type,
+            "unit": unit
+        })
+        example_attrs[field_name] = num + unit
+
+    # 构造示例文本
+    example_text = sample_text[:500] if len(sample_text) > 500 else sample_text
+
+    # 构建完整profile
+    doc_type = "structured_single"
+    task_mode = "single_record"
+    instruction = "从文档中提取关键信息"
+
+    # 简单启发式：如果字段数量多，可能为表格
+    if len(fields) > 5:
+        doc_type = "structured_table"
+        task_mode = "table_records"
+        instruction = "从文档中逐条提取记录"
+
+    # 关键字段启发式：第一个字段
+    dedup_key_fields = []
+    if fields and fields[0]["type"] == "text":
+        dedup_key_fields.append(fields[0]["name"])
+        fields[0]["required"] = True
+
+    profile = {
+        "report_name": "rule_generated",
+        "template_path": "",
+        "instruction": instruction,
+        "task_mode": task_mode,
+        "template_mode": "generic",
+        "_doc_type": doc_type,
+        "fields": fields,
+        "_example": example_attrs,
+        "_example_text": example_text,
+    }
+
+    if dedup_key_fields:
+        profile["dedup_key_fields"] = dedup_key_fields
+
+    return profile

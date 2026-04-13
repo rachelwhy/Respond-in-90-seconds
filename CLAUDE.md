@@ -270,7 +270,7 @@ A23_ENABLE_OCR=false
 - 生成测试用例（使用现有测试框架）
 - 分析实验日志（日志位于 `test/results/` 各任务目录）
 - 扩展知识库（更新 `src/knowledge/` 中的JSON文件：字段别名、归一化规则等）
-- 优化模型prompt（修改 `src/engine/prompt_builder.py`）
+- 优化模型 prompt（主要位于 `src/core/extraction_service.py` 的 `build_smart_prompt` 等，以实际代码为准）
 - 配置记录去重策略（在profile中设置 `dedup_key_fields`）
 
 ## AI不能做的事
@@ -300,3 +300,9 @@ A23_ENABLE_OCR=false
 - `test/assets/` - 基准任务资源（模板、输入、标准答案）
 - `test/results/` - 测试输出目录（按任务ID组织）
 - `test/reports/` - 验证报告和性能指标
+
+## 文档与仓库结构（当前）
+- 权威模块目录：`src/adapters/`、`src/api/`、`src/core/`、`src/knowledge/`（根目录下 **无** 独立的 `src/algorithm`、`src/pipeline`、`src/engine`、`src/parsers` 等旧路径）。
+- 架构与流程详解：[A23_TECHNICAL_FLOW.md](A23_TECHNICAL_FLOW.md)
+- HTTP 接口说明：[HTTP_API_USAGE.md](HTTP_API_USAGE.md)
+- **非功能性**优化探索与文档勘误：[PROJECT_OPTIMIZATION_REPORT_2026.md](PROJECT_OPTIMIZATION_REPORT_2026.md)

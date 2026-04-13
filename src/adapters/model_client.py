@@ -2,11 +2,22 @@ import json
 import re
 import os
 import requests
+import threading
 from typing import Optional, Dict, Any, List, Union
+import logging
+
+# 配置管理
+try:
+    from src.core.config_manager import get_config_manager
+    _config = get_config_manager()
+except ImportError:
+    # 向后兼容
+    _config = None
 
 from src.config import (
     MODEL_TYPE, OLLAMA_URL, OLLAMA_MODEL, OPENAI_BASE_URL, OPENAI_API_KEY, OPENAI_MODEL,
     MODEL_NAME, EMBEDDING_URL, EMBEDDING_MODEL, DEEPSEEK_BASE_URL, DEEPSEEK_API_KEY, DEEPSEEK_MODEL,
+    QWEN_BASE_URL, QWEN_API_KEY, QWEN_MODEL,
     TEMPERATURE, MAX_TOKENS
 )
 
@@ -29,18 +40,28 @@ except ImportError:
                 "temperature": TEMPERATURE,
                 "max_tokens": MAX_TOKENS,
             }
+        elif mt == "qwen":
+            return {
+                "type": mt,
+                "url": OLLAMA_URL,
+                "base_url": QWEN_BASE_URL,
+                "api_key": QWEN_API_KEY,
+                "model": QWEN_MODEL,
+                "temperature": TEMPERATURE,
+                "max_tokens": MAX_TOKENS,
+            }
         return {
             "type": mt,
             "url": OLLAMA_URL,
             "base_url": OPENAI_BASE_URL,
             "api_key": OPENAI_API_KEY,
-            "model": OPENAI_MODEL if mt in ["openai", "qwen"] else OLLAMA_MODEL,
+            "model": OPENAI_MODEL if mt == "openai" else OLLAMA_MODEL,
             "temperature": TEMPERATURE,
             "max_tokens": MAX_TOKENS,
         }
 
 
-def call_model(prompt: str, model_type: Optional[str] = None, total_deadline: Optional[float] = None) -> dict:
+def call_model(prompt: str, model_type: Optional[str] = None, total_deadline: Optional[float] = None, timeout: Optional[int] = None, temperature: Optional[float] = None, deadline_context=None) -> dict:
     """调用模型生成内容，支持 Ollama、OpenAI 兼容 API（如 Qwen）
 
     支持运行时配置管理，可以通过runtime_config动态修改模型配置
@@ -49,45 +70,78 @@ def call_model(prompt: str, model_type: Optional[str] = None, total_deadline: Op
         total_deadline: Unix 时间戳（time.time()），超过该时间则抛出 TimeoutError
     """
     import time as _time
+
+    # 处理deadline_context
+    if deadline_context:
+        try:
+            deadline_context.check_deadline()
+            # 使用deadline_context的剩余时间更新total_deadline
+            remaining = deadline_context.time_remaining()
+            if remaining is not None:
+                # 设置更严格的deadline，考虑网络请求时间
+                adjusted_deadline = _time.time() + remaining * 0.9  # 留出10%缓冲
+                if total_deadline is None or adjusted_deadline < total_deadline:
+                    total_deadline = adjusted_deadline
+        except Exception as e:
+            # 如果deadline_context已取消，抛出超时异常
+            raise TimeoutError(f"call_model: deadline_context检查失败: {e}")
+
     if total_deadline and _time.time() > total_deadline:
         raise TimeoutError("call_model: 已超过总时间限制")
 
     model_type = model_type or MODEL_TYPE
-    print(f'[INFO] 调用模型: {model_type}, 提示文本长度: {len(prompt)}')
+    logging.getLogger(__name__).info("调用模型: %s, 提示文本长度: %s", model_type, len(prompt))
 
     try:
         if model_type == "ollama":
-            result = _call_ollama(prompt, model_type=model_type, total_deadline=total_deadline)
+            result = _call_ollama(prompt, model_type=model_type, total_deadline=total_deadline, temperature=temperature)
         elif model_type == "openai":
-            result = _call_openai(prompt, model_type=model_type, total_deadline=total_deadline)
+            result = _call_openai(prompt, model_type=model_type, total_deadline=total_deadline, temperature=temperature)
         elif model_type == "qwen":
-            result = _call_qwen(prompt, model_type=model_type, total_deadline=total_deadline)
+            result = _call_qwen(prompt, model_type=model_type, total_deadline=total_deadline, temperature=temperature)
         elif model_type == "deepseek":
-            result = _call_deepseek(prompt, model_type=model_type, total_deadline=total_deadline)
+            result = _call_deepseek(prompt, model_type=model_type, total_deadline=total_deadline, temperature=temperature)
         else:
             raise ValueError(f"不支持的模型类型: {model_type}")
 
         # 输出模型响应信息
         if result:
             result_str = json.dumps(result, ensure_ascii=False)
-            print(f'[INFO] 模型响应解析完成，结果类型: {type(result).__name__}, 响应JSON长度: {len(result_str)}')
+            logging.getLogger(__name__).info(
+                "模型响应解析完成，结果类型: %s, 响应JSON长度: %s",
+                type(result).__name__,
+                len(result_str),
+            )
         else:
-            print(f'[WARN] 模型返回空结果')
+            logging.getLogger(__name__).warning("模型返回空结果")
 
         return result
     except Exception as e:
-        print(f'[ERROR] 模型调用失败: {e}')
+        logging.getLogger(__name__).error("模型调用失败: %s", e)
         raise
 
 
 def call_embedding(text: str) -> List[float]:
-    """调用 Ollama embeddings API 获取文本向量表示
+    """调用 Ollama embeddings API 获取文本向量表示，强制使用 UTF-8 编码
 
     Returns:
         float 向量列表；若服务不可用则抛出异常
     """
+    import json
+
+    # 确保 text 是有效的 UTF-8 字符串
+    if isinstance(text, bytes):
+        text = text.decode('utf-8', errors='replace')
+    else:
+        text = text.encode('utf-8', errors='replace').decode('utf-8')
+
     payload = {"model": EMBEDDING_MODEL, "prompt": text}
-    resp = requests.post(EMBEDDING_URL, json=payload, timeout=30)
+
+    # 手动序列化 JSON，确保使用 UTF-8（不依赖系统默认编码）
+    json_str = json.dumps(payload, ensure_ascii=False)
+    json_bytes = json_str.encode('utf-8')
+
+    resp = requests.post(EMBEDDING_URL, data=json_bytes, timeout=30)
     resp.raise_for_status()
     data = resp.json()
     embedding = data.get("embedding") or data.get("embeddings")
@@ -96,21 +150,32 @@ def call_embedding(text: str) -> List[float]:
     return embedding
 
 
-def _call_ollama(prompt: str, model_type: Optional[str] = None, total_deadline: Optional[float] = None) -> dict:
-    """调用 Ollama 模型，支持重试"""
+def _call_ollama(prompt: str, model_type: Optional[str] = None, total_deadline: Optional[float] = None, temperature: Optional[float] = None) -> dict:
+    """调用 Ollama 模型，强制使用 UTF-8 编码。
+
+    不使用 format=json / 解析后二次请求：小模型在长表抽取时易被约束成更短输出，条数反而下降。
+    """
     import time as _time
-    # 获取运行时配置
+    import json
     config = get_model_config(model_type or "ollama")
+
+    if isinstance(prompt, bytes):
+        prompt = prompt.decode('utf-8', errors='replace')
+    else:
+        prompt = prompt.encode('utf-8', errors='replace').decode('utf-8')
 
     payload = {
         "model": config.get("model", MODEL_NAME),
         "prompt": prompt,
         "stream": False,
         "options": {
-            "temperature": config.get("temperature", TEMPERATURE),
-            "num_predict": config.get("max_tokens", MAX_TOKENS)
-        }
+            "temperature": temperature if temperature is not None else config.get("temperature", TEMPERATURE),
+            "num_predict": config.get("max_tokens", MAX_TOKENS),
+        },
     }
+
+    json_str = json.dumps(payload, ensure_ascii=False)
+    json_bytes = json_str.encode('utf-8')
 
     max_retries = 3
     last_exception = None
@@ -119,52 +184,64 @@ def _call_ollama(prompt: str, model_type: Optional[str] = None, total_deadline: 
         if total_deadline and _time.time() > total_deadline:
             raise TimeoutError("Ollama: 已超过总时间限制")
         try:
-            # 每次重试增加超时时间：120, 180, 240秒
             timeout = 120 + (attempt * 60)
-            resp = requests.post(config.get("url", OLLAMA_URL), json=payload, timeout=timeout)
+            resp = requests.post(config.get("url", OLLAMA_URL), data=json_bytes, timeout=timeout)
             resp.raise_for_status()
             response_data = resp.json()
-            result = response_data["response"].strip()
-            print(f'[INFO] Ollama原始响应长度: {len(result)}')
-
+            result = (response_data.get("response") or "").strip()
+            logging.getLogger(__name__).debug("Ollama原始响应长度: %s", len(result))
             parsed = _parse_model_response(result)
-            print(f'[INFO] Ollama解析后结果类型: {type(parsed).__name__}')
+            logging.getLogger(__name__).debug("Ollama解析后结果类型: %s", type(parsed).__name__)
             return parsed
 
         except requests.exceptions.Timeout as e:
-            print(f"[WARN] Ollama调用超时，尝试 {attempt + 1}/{max_retries}，超时设置: {timeout}秒")
+            logging.getLogger(__name__).warning(
+                "Ollama调用超时，尝试 %s/%s，超时设置: %s秒",
+                attempt + 1,
+                max_retries,
+                timeout,
+            )
             last_exception = e
             if attempt < max_retries - 1:
-                _time.sleep(2)  # 等待2秒后重试
+                _time.sleep(2)
         except Exception as e:
-            # 其他错误，不重试
             raise e
 
-    # 所有重试都失败
     raise Exception(f"Ollama调用失败，重试{max_retries}次后仍然超时: {last_exception}")
 
 
-def _call_openai(prompt: str, model_type: Optional[str] = None, total_deadline: Optional[float] = None) -> dict:
-    """调用 OpenAI 兼容 API（如本地部署的 Qwen），支持重试"""
+def _call_openai(prompt: str, model_type: Optional[str] = None, total_deadline: Optional[float] = None, temperature: Optional[float] = None) -> dict:
+    """调用 OpenAI 兼容 API（如本地部署的 Qwen），强制使用 UTF-8 编码"""
     import time as _time
+    import json
     # 获取运行时配置
     config = get_model_config(model_type or "openai")
 
     headers = {
-        "Content-Type": "application/json",
+        "Content-Type": "application/json; charset=utf-8",
     }
 
     api_key = config.get("api_key", OPENAI_API_KEY)
     if api_key and api_key != "not-needed":
         headers["Authorization"] = f"Bearer {api_key}"
 
+    # 确保 prompt 是有效的 UTF-8 字符串
+    if isinstance(prompt, bytes):
+        prompt = prompt.decode('utf-8', errors='replace')
+    else:
+        prompt = prompt.encode('utf-8', errors='replace').decode('utf-8')
+
     payload = {
         "model": config.get("model", OPENAI_MODEL),
         "messages": [{"role": "user", "content": prompt}],
-        "temperature": config.get("temperature", TEMPERATURE),
+        "temperature": temperature if temperature is not None else config.get("temperature", TEMPERATURE),
         "max_tokens": config.get("max_tokens", MAX_TOKENS),
         "stream": False
     }
+
+    # 手动序列化 JSON，确保使用 UTF-8（不依赖系统默认编码）
+    json_str = json.dumps(payload, ensure_ascii=False)
+    json_bytes = json_str.encode('utf-8')
 
     max_retries = 3
     last_exception = None
@@ -176,18 +253,24 @@ def _call_openai(prompt: str, model_type: Optional[str] = None, total_deadline: 
             # 每次重试增加超时时间：120, 180, 240秒
             timeout = 120 + (attempt * 60)
             base_url = config.get("base_url", OPENAI_BASE_URL)
-            resp = requests.post(f"{base_url}/chat/completions", json=payload, headers=headers, timeout=timeout)
+            # 使用 data 参数发送字节流，而非 json 参数
+            resp = requests.post(f"{base_url}/chat/completions", data=json_bytes, headers=headers, timeout=timeout)
             resp.raise_for_status()
             response_data = resp.json()
             result = response_data["choices"][0]["message"]["content"].strip()
-            print(f'[INFO] OpenAI原始响应长度: {len(result)}')
+            logging.getLogger(__name__).debug("OpenAI原始响应长度: %s", len(result))
 
             parsed = _parse_model_response(result)
-            print(f'[INFO] OpenAI解析后结果类型: {type(parsed).__name__}')
+            logging.getLogger(__name__).debug("OpenAI解析后结果类型: %s", type(parsed).__name__)
             return parsed
 
         except requests.exceptions.Timeout as e:
-            print(f"[WARN] OpenAI API调用超时，尝试 {attempt + 1}/{max_retries}，超时设置: {timeout}秒")
+            logging.getLogger(__name__).warning(
+                "OpenAI API调用超时，尝试 %s/%s，超时设置: %s秒",
+                attempt + 1,
+                max_retries,
+                timeout,
+            )
             last_exception = e
             if attempt < max_retries - 1:
                 _time.sleep(2)  # 等待2秒后重试
@@ -199,35 +282,45 @@ def _call_openai(prompt: str, model_type: Optional[str] = None, total_deadline: 
     raise Exception(f"OpenAI API调用失败，重试{max_retries}次后仍然超时: {last_exception}")
 
 
-def _call_qwen(prompt: str, model_type: Optional[str] = None, total_deadline: Optional[float] = None) -> dict:
+def _call_qwen(prompt: str, model_type: Optional[str] = None, total_deadline: Optional[float] = None, temperature: Optional[float] = None) -> dict:
     """调用 Qwen 模型（兼容 OpenAI API）"""
     # Qwen 通常使用 OpenAI 兼容接口，所以调用 openai 方法
-    return _call_openai(prompt, model_type or "qwen", total_deadline=total_deadline)
+    return _call_openai(prompt, model_type or "qwen", total_deadline=total_deadline, temperature=temperature)
 
 
-def _call_deepseek(prompt: str, model_type: Optional[str] = None, total_deadline: Optional[float] = None) -> dict:
-    """调用DeepSeek API"""
+def _call_deepseek(prompt: str, model_type: Optional[str] = None, total_deadline: Optional[float] = None, temperature: Optional[float] = None) -> dict:
+    """调用 DeepSeek API，强制使用 UTF-8 编码"""
     import time as _time
-    # 获取运行时配置
+    import json
+
     config = get_model_config(model_type or "deepseek")
 
     headers = {
-        "Content-Type": "application/json",
+        "Content-Type": "application/json; charset=utf-8",
     }
 
     api_key = config.get("api_key", DEEPSEEK_API_KEY)
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
 
+    # 确保 prompt 是有效的 UTF-8 字符串
+    if isinstance(prompt, bytes):
+        prompt = prompt.decode('utf-8', errors='replace')
+    else:
+        prompt = prompt.encode('utf-8', errors='replace').decode('utf-8')
+
     payload = {
         "model": config.get("model", DEEPSEEK_MODEL),
         "messages": [{"role": "user", "content": prompt}],
-        "temperature": config.get("temperature", TEMPERATURE),
+        "temperature": temperature if temperature is not None else config.get("temperature", TEMPERATURE),
         "max_tokens": config.get("max_tokens", MAX_TOKENS),
         "stream": False
     }
 
-    # 使用与OpenAI相同的重试机制
+    # 手动序列化 JSON，确保使用 UTF-8（不依赖系统默认编码）
+    json_str = json.dumps(payload, ensure_ascii=False)
+    json_bytes = json_str.encode('utf-8')
+
     max_retries = 3
     last_exception = None
 
@@ -237,23 +330,28 @@ def _call_deepseek(prompt: str, model_type: Optional[str] = None, total_deadline
         try:
             timeout = 120 + (attempt * 60)
             base_url = config.get("base_url", DEEPSEEK_BASE_URL)
+            # 使用 data 参数发送字节流，而非 json 参数
             resp = requests.post(
                 f"{base_url}/chat/completions",
-                json=payload,
+                data=json_bytes,  # 关键修改：使用 data 而不是 json
                 headers=headers,
                 timeout=timeout
             )
             resp.raise_for_status()
             response_data = resp.json()
             result = response_data["choices"][0]["message"]["content"].strip()
-            print(f'[INFO] DeepSeek原始响应长度: {len(result)}')
+            logging.getLogger(__name__).debug("DeepSeek原始响应长度: %s", len(result))
 
             parsed = _parse_model_response(result)
-            print(f'[INFO] DeepSeek解析后结果类型: {type(parsed).__name__}')
+            logging.getLogger(__name__).debug("DeepSeek解析后结果类型: %s", type(parsed).__name__)
             return parsed
 
         except requests.exceptions.Timeout as e:
-            print(f"[WARN] DeepSeek API调用超时，尝试 {attempt + 1}/{max_retries}")
+            logging.getLogger(__name__).warning(
+                "DeepSeek API调用超时，尝试 %s/%s",
+                attempt + 1,
+                max_retries,
+            )
             last_exception = e
             if attempt < max_retries - 1:
                 _time.sleep(2)
@@ -667,6 +765,52 @@ class ModelClient:
 
 
 # ============================================================================
+# 配置上下文管理器（用于临时修改配置）
+# ============================================================================
+
+class ConfigContext:
+    """配置上下文管理器，用于临时修改配置（线程安全）"""
+
+    def __init__(self, config_updates: Dict[str, Any]):
+        """
+        Args:
+            config_updates: 要临时更新的配置字典，键为配置名（如"OLLAMA_URL"）
+        """
+        self.config_updates = config_updates
+        self.original_values = {}
+        self._config = _config
+
+    def __enter__(self):
+        """进入上下文，保存原始值并设置新值"""
+        global _config
+        if self._config is None:
+            # 尝试动态导入ConfigManager（激进清理：不再直接使用os.environ）
+            try:
+                from src.core.config_manager import get_config_manager
+                _config = get_config_manager()
+                self._config = _config
+            except ImportError:
+                raise ImportError("ConfigManager不可用，且不允许直接使用os.environ。请确保src.core.config_manager已正确安装。")
+
+        # 使用ConfigManager（线程安全）
+        for key, value in self.config_updates.items():
+            self.original_values[key] = self._config.get(key)
+            self._config.set(key, value, notify=False)
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        """退出上下文，恢复原始值"""
+        # 使用ConfigManager恢复配置
+        for key, original_value in self.original_values.items():
+            if original_value is not None:
+                self._config.set(key, original_value, notify=False)
+            else:
+                # 如果没有原始值，删除该配置（恢复为默认值）
+                pass  # ConfigManager不支持删除配置，设置为None
+                self._config.set(key, None, notify=False)
+
+
+# ============================================================================
 # ModelGateway 类 - 多模型网关，支持优先级和故障转移
 # ============================================================================
 
@@ -712,8 +856,14 @@ class ModelGateway:
             model_type = model_config.get("type", "ollama")
             model_name = model_config.get("model", "")
 
-            print(f"[INFO] ModelGateway: 尝试模型 {model_idx+1}/{len(self.models)} "
-                  f"(type={model_type}, model={model_name}, priority={model_config.get('priority', 999)})")
+            logging.getLogger(__name__).debug(
+                "ModelGateway: 尝试模型 %s/%s (type=%s, model=%s, priority=%s)",
+                model_idx + 1,
+                len(self.models),
+                model_type,
+                model_name,
+                model_config.get("priority", 999),
+            )
 
             self.metrics["calls"][model_idx] += 1
             start_time = time.time()
@@ -728,8 +878,12 @@ class ModelGateway:
                 self.metrics["successes"][model_idx] += 1
                 self.metrics["response_times"][model_idx].append(elapsed)
 
-                print(f"[INFO] ModelGateway: 模型 {model_type}/{model_name} 调用成功, "
-                      f"耗时 {elapsed:.2f}秒")
+                logging.getLogger(__name__).info(
+                    "ModelGateway: 模型 %s/%s 调用成功, 耗时 %.2fs",
+                    model_type,
+                    model_name,
+                    elapsed,
+                )
                 self.current_model_index = model_idx  # 记录当前成功模型
                 return result
 
@@ -738,55 +892,68 @@ class ModelGateway:
                 self.metrics["failures"][model_idx] += 1
                 self.metrics["response_times"][model_idx].append(elapsed)
 
-                print(f"[WARN] ModelGateway: 模型 {model_type}/{model_name} 调用失败: {str(e)}")
+                logging.getLogger(__name__).warning(
+                    "ModelGateway: 模型 %s/%s 调用失败: %s",
+                    model_type,
+                    model_name,
+                    str(e),
+                )
                 # 继续尝试下一个模型
                 continue
 
         # 所有模型都失败
         error_msg = f"ModelGateway: 所有 {len(self.models)} 个模型都调用失败"
-        print(f"[ERROR] {error_msg}")
+        logging.getLogger(__name__).error("%s", error_msg)
         raise Exception(error_msg)
 
     def _call_with_config(self, prompt: str, model_config: Dict[str, Any], max_retries: int) -> dict:
         """使用特定模型配置调用模型"""
         model_type = model_config.get("type", "ollama")
 
-        # 对于不同类型的模型，准备不同的参数
+        # 准备要临时更新的配置
+        config_updates = {}
+
         if model_type == "ollama":
-            # 临时覆盖配置
-            import os
-            original_url = os.environ.get("A23_OLLAMA_URL")
-            original_model = os.environ.get("A23_OLLAMA_MODEL")
+            # Ollama配置映射
+            if "url" in model_config:
+                config_updates["OLLAMA_URL"] = model_config["url"]
+            if "model" in model_config:
+                config_updates["OLLAMA_MODEL"] = model_config["model"]
+                config_updates["MODEL_NAME"] = model_config["model"]
 
-            try:
-                if "url" in model_config:
-                    os.environ["A23_OLLAMA_URL"] = model_config["url"]
-                if "model" in model_config:
-                    os.environ["A23_OLLAMA_MODEL"] = model_config["model"]
-                    os.environ["A23_MODEL_NAME"] = model_config["model"]
+        elif model_type == "openai":
+            # OpenAI配置映射
+            if "api_key" in model_config:
+                config_updates["OPENAI_API_KEY"] = model_config["api_key"]
+            if "base_url" in model_config:
+                config_updates["OPENAI_BASE_URL"] = model_config["base_url"]
+            if "model" in model_config:
+                config_updates["OPENAI_MODEL"] = model_config["model"]
 
-                # 调用现有函数
-                return call_model(prompt, model_type=model_type)
-            finally:
-                # 恢复环境变量
-                if original_url is not None:
-                    os.environ["A23_OLLAMA_URL"] = original_url
-                else:
-                    os.environ.pop("A23_OLLAMA_URL", None)
-                if original_model is not None:
-                    os.environ["A23_OLLAMA_MODEL"] = original_model
-                    os.environ["A23_MODEL_NAME"] = original_model
-                else:
-                    os.environ.pop("A23_OLLAMA_MODEL", None)
-                    os.environ.pop("A23_MODEL_NAME", None)
+        elif model_type == "deepseek":
+            # DeepSeek配置映射
+            if "api_key" in model_config:
+                config_updates["DEEPSEEK_API_KEY"] = model_config["api_key"]
+            if "base_url" in model_config:
+                config_updates["DEEPSEEK_BASE_URL"] = model_config["base_url"]
+            if "model" in model_config:
+                config_updates["DEEPSEEK_MODEL"] = model_config["model"]
 
-        elif model_type in ["openai", "qwen", "deepseek"]:
-            # 类似地处理其他模型类型
-            # 简化实现：直接调用call_model，假设配置已通过环境变量设置
-            # 在实际实现中，需要类似地临时覆盖环境变量
-            return call_model(prompt, model_type=model_type)
+        elif model_type == "qwen":
+            # Qwen配置映射
+            if "api_key" in model_config:
+                config_updates["QWEN_API_KEY"] = model_config["api_key"]
+            if "base_url" in model_config:
+                config_updates["QWEN_BASE_URL"] = model_config["base_url"]
+            if "model" in model_config:
+                config_updates["QWEN_MODEL"] = model_config["model"]
+
         else:
             raise ValueError(f"不支持的模型类型: {model_type}")
+
+        # 使用配置上下文管理器临时更新配置
+        with ConfigContext(config_updates):
+            return call_model(prompt, model_type=model_type)
 
     def health_check(self) -> Dict[str, Any]:
         """检查所有配置的模型是否可用
@@ -808,15 +975,25 @@ class ModelGateway:
             try:
                 # 设置短超时
                 import requests
+                import json
                 if model_type == "ollama":
                     url = model_config.get("url", "http://127.0.0.1:11434/api/generate")
+                    # 确保 test_prompt 是有效的 UTF-8 字符串
+                    if isinstance(test_prompt, bytes):
+                        test_prompt = test_prompt.decode('utf-8', errors='replace')
+                    else:
+                        test_prompt = test_prompt.encode('utf-8', errors='replace').decode('utf-8')
+
                     payload = {
                         "model": model_name,
                         "prompt": test_prompt,
                         "stream": False,
                         "options": {"temperature": 0.1, "num_predict": 10}
                     }
-                    resp = requests.post(url, json=payload, timeout=5)
+                    # 手动序列化 JSON，确保使用 UTF-8
+                    json_str = json.dumps(payload, ensure_ascii=False)
+                    json_bytes = json_str.encode('utf-8')
+                    resp = requests.post(url, data=json_bytes, timeout=5)
                     resp.raise_for_status()
                     status = "healthy"
                 else:

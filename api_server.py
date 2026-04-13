@@ -3,47 +3,334 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import shutil
 import threading
 import time
 import uuid
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Tuple, Dict, Any
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile, Depends, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 
 from src.api.qna_service import answer_question
-from src.api.task_manager import task_manager
 from src.api.direct_extractor import direct_extract
+# 任务系统（/api/tasks/*）默认关闭：生产由后端负责任务/异步
+from src.config import (
+    ENABLE_TASKS,
+    PERSIST_UPLOADS,
+    UPLOAD_RETENTION_HOURS,
+    TEMP_RETENTION_HOURS,
+)
+if ENABLE_TASKS:
+    from src.api.task_manager import task_manager
+# 复杂度评估器已删除，使用简单估算
 
-# 持久化上传文件目录（requests 结束后文件不会丢失）
-STORAGE_ROOT = Path("storage/uploads")
-STORAGE_ROOT.mkdir(parents=True, exist_ok=True)
+def _get_storage_root() -> Path:
+    root = Path("storage/uploads")
+    root.mkdir(parents=True, exist_ok=True)
+    return root
+
+
+def _get_temp_storage_dir() -> Path:
+    d = _get_storage_root() / "temp"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
 
 
 def _cleanup_old_uploads():
-    """后台清理线程：删除超过 24 小时的上传目录"""
+    """后台清理线程：删除过期上传目录与临时文件"""
     while True:
         try:
-            cutoff = time.time() - 86400  # 24 小时
-            for child in STORAGE_ROOT.iterdir():
+            # 清理超过24小时的上传目录
+            storage_root = _get_storage_root()
+            dir_cutoff = time.time() - max(1, int(UPLOAD_RETENTION_HOURS)) * 3600
+            for child in storage_root.iterdir():
                 if child.is_dir():
                     try:
                         mtime = child.stat().st_mtime
-                        if mtime < cutoff:
+                        if mtime < dir_cutoff:
                             shutil.rmtree(child, ignore_errors=True)
                     except Exception:
                         pass
+
+            # 清理超过1小时的临时文件（TEMP_STORAGE_DIR 中的文件）
+            temp_dir = _get_temp_storage_dir()
+            file_cutoff = time.time() - max(1, int(TEMP_RETENTION_HOURS)) * 3600
+            if temp_dir.exists():
+                for file_path in temp_dir.iterdir():
+                    if file_path.is_file():
+                        try:
+                            mtime = file_path.stat().st_mtime
+                            if mtime < file_cutoff:
+                                file_path.unlink(missing_ok=True)
+                        except Exception:
+                            pass
         except Exception:
             pass
         time.sleep(3600)  # 每小时检查一次
 
 
-_cleanup_thread = threading.Thread(target=_cleanup_old_uploads, daemon=True)
-_cleanup_thread.start()
+if PERSIST_UPLOADS:
+    _cleanup_thread = threading.Thread(target=_cleanup_old_uploads, daemon=True)
+    _cleanup_thread.start()
+
+
+async def _estimate_document_complexity(files: List[UploadFile], template_file: Optional[UploadFile] = None, task_mode: str = "full") -> Dict[str, Any]:
+    """估算文档处理复杂度和处理时间（基于内容分析）
+
+    Args:
+        files: 输入文件列表
+        template_file: 模板文件（可选）
+        task_mode: 处理模式（full/supplement/off）
+
+    Returns:
+        包含估算信息的字典，包含详细的复杂度指标
+    """
+    import tempfile
+    import os
+    from pathlib import Path
+
+    # 保存上传文件到临时目录
+    temp_files = []
+    document_paths = []
+
+    def _fallback_estimate() -> Dict[str, Any]:
+        """简单估算逻辑（始终返回 dict）"""
+        total_size_bytes = 0
+        total_text_estimate = 0  # 仅做粗略“文本量”估计（不是 token）
+
+        for file in files:
+            file_size = 0
+            if hasattr(file, 'size'):
+                file_size = int(file.size or 0)
+            else:
+                try:
+                    current_pos = file.file.tell()
+                    file.file.seek(0, 2)
+                    file_size = int(file.file.tell() or 0)
+                    file.file.seek(current_pos)
+                except Exception:
+                    file_size = 0
+
+            total_size_bytes += file_size
+
+            filename = file.filename or ''
+            if any(filename.lower().endswith(ext) for ext in ['.txt', '.md', '.json', '.csv']):
+                total_text_estimate += file_size
+            elif any(filename.lower().endswith(ext) for ext in ['.xlsx', '.xls', '.docx', '.doc']):
+                total_text_estimate += file_size * 3
+            elif filename.lower().endswith('.pdf'):
+                total_text_estimate += file_size * 2
+            else:
+                total_text_estimate += file_size
+
+        if template_file:
+            template_size = 0
+            if hasattr(template_file, 'size'):
+                template_size = int(template_file.size or 0)
+            else:
+                try:
+                    current_pos = template_file.file.tell()
+                    template_file.file.seek(0, 2)
+                    template_size = int(template_file.file.tell() or 0)
+                    template_file.seek(current_pos)
+                except Exception:
+                    template_size = 0
+            total_size_bytes += template_size
+
+        total_size_mb = total_size_bytes / (1024 * 1024)
+        estimated_chunks = max(1, total_text_estimate // 3000)
+        base_time = 2.0
+        per_chunk_time = 3.0
+        estimated_processing_time = base_time + (estimated_chunks * per_chunk_time)
+
+        if task_mode == "off":
+            complexity_level = "low" if total_size_mb < 5 else "medium"
+            recommendation = "direct"
+        elif task_mode == "supplement":
+            if total_size_mb < 2 and estimated_chunks < 10:
+                complexity_level = "low"
+                recommendation = "direct"
+            elif total_size_mb < 5 and estimated_chunks < 30:
+                complexity_level = "medium"
+                recommendation = "direct"
+            else:
+                complexity_level = "high"
+                recommendation = "async"
+        else:  # full
+            if total_size_mb < 1 and estimated_chunks < 5:
+                complexity_level = "low"
+                recommendation = "direct"
+            elif total_size_mb < 3 and estimated_chunks < 20:
+                complexity_level = "medium"
+                recommendation = "direct"
+            else:
+                complexity_level = "high"
+                recommendation = "async"
+
+        if total_size_mb > 5:
+            recommendation = "async"
+            complexity_level = "very_high"
+
+        return {
+            "total_size_bytes": total_size_bytes,
+            "total_size_mb": round(total_size_mb, 2),
+            "total_text_length_estimate": total_text_estimate,
+            "estimated_chunks": estimated_chunks,
+            "estimated_processing_time_seconds": round(estimated_processing_time, 1),
+            "complexity_level": complexity_level,
+            "recommendation": recommendation,
+            "max_chunks_threshold": 30,
+            "max_size_mb_threshold": 5.0,
+            "text_complexity_score": 0,
+            "structure_complexity_score": 0,
+            "extraction_complexity_score": 0,
+            "overall_score": 0,
+            "estimated_pages": 0,
+            "field_count": 0,
+            "estimated_output_tokens": 0,
+            "exceeds_direct_threshold": total_size_mb > 5 or estimated_chunks > 30,
+            "exceeds_timeout_threshold": estimated_processing_time > 30,
+        }
+
+    try:
+        # 保存输入文件
+        for file in files:
+            # 创建临时文件
+            suffix = Path(file.filename or "unknown").suffix
+            with tempfile.NamedTemporaryFile(mode='wb', suffix=suffix, delete=False) as tmp:
+                content = await file.read()
+                tmp.write(content)
+                tmp_path = tmp.name
+                temp_files.append(tmp_path)
+                document_paths.append(tmp_path)
+                # 重置文件指针，以便后续读取
+                await file.seek(0)
+
+        # 保存模板文件（如果有）
+        template_path = None
+        if template_file:
+            suffix = Path(template_file.filename or "template").suffix
+            with tempfile.NamedTemporaryFile(mode='wb', suffix=suffix, delete=False) as tmp:
+                content = await template_file.read()
+                tmp.write(content)
+                template_path = tmp.name
+                temp_files.append(template_path)
+                # 重置文件指针
+                await template_file.seek(0)
+
+        # 复杂度评估器已删除，使用简单估算
+        logger = logging.getLogger(__name__)
+        logger.info("使用简单复杂度估算（复杂度评估器已删除）")
+
+        # 优先：对可解析格式使用 Docling 实际分块/文本长度做估算（更准确，避免误判）
+        try:
+            from src.adapters.docling_adapter import DoclingParser, DOCLING_AVAILABLE as _DOCLING_AVAILABLE
+        except Exception:
+            _DOCLING_AVAILABLE = False
+            DoclingParser = None  # type: ignore
+
+        if _DOCLING_AVAILABLE and DoclingParser is not None and document_paths:
+            try:
+                parser = DoclingParser(enable_ocr=False)
+                total_chars = 0
+                total_chunks = 0
+                total_tables = 0
+                total_pages = 0
+
+                for pth in document_paths:
+                    suffix = (Path(pth).suffix or "").lower()
+                    # 仅对 Docling 有把握的格式做“复杂度估算解析”，避免无谓耗时
+                    if suffix not in (".docx", ".pdf", ".pptx", ".xlsx", ".xls"):
+                        continue
+                    parsed = parser.parse(pth)
+                    if parsed.get("error"):
+                        continue
+                    total_chars += len(parsed.get("text") or "")
+                    total_chunks += len(parsed.get("chunks") or [])
+                    total_tables += len(parsed.get("tables") or [])
+                    total_pages += int(parsed.get("pages") or 0)
+
+                total_size_bytes = 0
+                for tf in temp_files:
+                    try:
+                        total_size_bytes += int(os.path.getsize(tf) or 0)
+                    except Exception:
+                        pass
+                if template_path:
+                    try:
+                        total_size_bytes += int(os.path.getsize(template_path) or 0)
+                    except Exception:
+                        pass
+
+                total_size_mb = total_size_bytes / (1024 * 1024)
+                estimated_chunks = max(1, total_chunks) if total_chunks > 0 else max(1, total_chars // 1500)
+                # 用“块数 + 模式”估算时间：这里不追求绝对准确，只用于 direct/async 分流
+                base_time = 2.0
+                per_chunk_time = 3.0 if task_mode != "off" else 0.5
+                estimated_processing_time = base_time + (estimated_chunks * per_chunk_time)
+
+                max_chunks_threshold = 30
+                max_size_mb_threshold = 5.0
+                exceeds_direct = (total_size_mb > max_size_mb_threshold) or (estimated_chunks > max_chunks_threshold)
+
+                # recommendation 基于阈值（与 direct 端点逻辑一致）
+                recommendation = "async" if exceeds_direct else "direct"
+                if task_mode == "off":
+                    recommendation = "direct" if total_size_mb <= max_size_mb_threshold else "async"
+
+                complexity_level = "low"
+                if exceeds_direct:
+                    complexity_level = "high"
+                elif estimated_chunks > 10:
+                    complexity_level = "medium"
+
+                return {
+                    "total_size_bytes": total_size_bytes,
+                    "total_size_mb": round(total_size_mb, 2),
+                    "total_text_length_estimate": total_chars,
+                    "estimated_chunks": int(estimated_chunks),
+                    "estimated_processing_time_seconds": round(estimated_processing_time, 1),
+                    "complexity_level": complexity_level,
+                    "recommendation": recommendation,
+                    "max_chunks_threshold": max_chunks_threshold,
+                    "max_size_mb_threshold": max_size_mb_threshold,
+                    "text_complexity_score": 0,
+                    "structure_complexity_score": 0,
+                    "extraction_complexity_score": 0,
+                    "overall_score": 0,
+                    "estimated_pages": total_pages,
+                    "field_count": 0,
+                    "estimated_output_tokens": 0,
+                    "tables_count": total_tables,
+                    "exceeds_direct_threshold": exceeds_direct,
+                    "exceeds_timeout_threshold": estimated_processing_time > 30,
+                    "estimator": "docling",
+                }
+            except Exception:
+                # Docling 估算失败则回退启发式
+                pass
+
+        return _fallback_estimate()
+
+    except Exception as e:
+        # 如果估算失败，记录警告
+        logger = logging.getLogger(__name__)
+        logger.warning(f"复杂度估算失败: {e}")
+        return _fallback_estimate()
+
+    finally:
+        # 清理临时文件
+        for temp_file in temp_files:
+            try:
+                if os.path.exists(temp_file):
+                    os.unlink(temp_file)
+            except:
+                pass
 
 
 app = FastAPI(title='A23 AI Demo HTTP API', version='2.0.0')
@@ -81,6 +368,8 @@ def health():
 
 @app.get('/api/tasks')
 def list_tasks():
+    if not ENABLE_TASKS:
+        raise HTTPException(status_code=404, detail="tasks接口已禁用（A23_ENABLE_TASKS=false）")
     return {'tasks': task_manager.list_tasks()}
 
 
@@ -97,6 +386,8 @@ async def create_task(
     max_chunks: int = Form(default=50),
     quiet: bool = Form(default=False),
 ):
+    if not ENABLE_TASKS:
+        raise HTTPException(status_code=404, detail="tasks接口已禁用（A23_ENABLE_TASKS=false）")
     if not input_files:
         raise HTTPException(status_code=400, detail='至少需要上传一个输入文件')
 
@@ -178,6 +469,8 @@ async def create_task(
 def get_task(
     task_id: str,
 ):
+    if not ENABLE_TASKS:
+        raise HTTPException(status_code=404, detail="tasks接口已禁用（A23_ENABLE_TASKS=false）")
     info = task_manager.get_task(task_id)
     if not info:
         raise HTTPException(status_code=404, detail='task_id 不存在')
@@ -192,6 +485,8 @@ def get_events(
     task_id: str,
     limit: int = 200,
 ):
+    if not ENABLE_TASKS:
+        raise HTTPException(status_code=404, detail="tasks接口已禁用（A23_ENABLE_TASKS=false）")
     info = task_manager.get_task(task_id)
     if not info:
         raise HTTPException(status_code=404, detail='task_id 不存在')
@@ -207,6 +502,8 @@ def get_task_log(
     task_id: str,
     tail: int = 100,
 ):
+    if not ENABLE_TASKS:
+        raise HTTPException(status_code=404, detail="tasks接口已禁用（A23_ENABLE_TASKS=false）")
     """获取任务专属日志，支持 ?tail=N 参数返回最后 N 行"""
     info = task_manager.get_task(task_id)
     if not info:
@@ -225,6 +522,8 @@ def get_task_log(
 async def stream_events(
     task_id: str,
 ):
+    if not ENABLE_TASKS:
+        raise HTTPException(status_code=404, detail="tasks接口已禁用（A23_ENABLE_TASKS=false）")
     info = task_manager.get_task(task_id)
     if not info:
         raise HTTPException(status_code=404, detail='task_id 不存在')
@@ -252,6 +551,8 @@ async def stream_events(
 def get_result(
     task_id: str,
 ):
+    if not ENABLE_TASKS:
+        raise HTTPException(status_code=404, detail="tasks接口已禁用（A23_ENABLE_TASKS=false）")
     info = task_manager.get_task(task_id)
     if not info:
         raise HTTPException(status_code=404, detail='task_id 不存在')
@@ -273,6 +574,8 @@ def download_result(
     task_id: str,
     kind: str,
 ):
+    if not ENABLE_TASKS:
+        raise HTTPException(status_code=404, detail="tasks接口已禁用（A23_ENABLE_TASKS=false）")
     output_files = task_manager.get_output_files(task_id)
     path = output_files.get(kind)
     if not path or not os.path.exists(path):
@@ -284,6 +587,8 @@ def download_result(
 def delete_task(
     task_id: str,
 ):
+    if not ENABLE_TASKS:
+        raise HTTPException(status_code=404, detail="tasks接口已禁用（A23_ENABLE_TASKS=false）")
     info = task_manager.get_task(task_id)
     if not info:
         raise HTTPException(status_code=404, detail='task_id 不存在')
@@ -479,6 +784,68 @@ def switch_model(
     }
 
 
+@app.post('/api/extract/pre-analyze')
+async def pre_analyze_documents(
+    template: UploadFile = File(None),
+    input_files: List[UploadFile] = File(...),
+    task_mode: str = Form("full"),
+):
+    """预分析文档复杂度，预估处理时间和建议
+
+    在正式处理前，用户可上传文档进行复杂度分析，获取：
+    1. 预估处理时间和资源需求
+    2. 处理建议（直接处理 vs 异步任务）
+    3. 推荐配置参数（超时时间、分块数等）
+
+    Args:
+        template: 模板文件（可选）
+        input_files: 输入文件列表
+
+    Returns:
+        包含预分析结果的字典
+    """
+    if not input_files:
+        raise HTTPException(status_code=400, detail='至少需要上传一个输入文件')
+
+    # 估算文档复杂度
+    complexity_info = _estimate_document_complexity(input_files, template, task_mode)
+
+    # 添加详细建议
+    recommendation = complexity_info["recommendation"]
+    if recommendation == "direct":
+        complexity_info["suggestion"] = {
+            "use_endpoint": "POST /api/extract/direct",
+            "recommended_timeout": int(complexity_info["estimated_processing_time_seconds"] * 1.5 + 10),
+            "recommended_max_chunks": min(complexity_info["estimated_chunks"] + 5, 50),
+            "reason": f"文档大小适中 ({complexity_info['total_size_mb']}MB)，预估处理时间{complexity_info['estimated_processing_time_seconds']}秒"
+        }
+    else:
+        complexity_info["suggestion"] = {
+            "use_endpoint": "POST /api/tasks/create",
+            "recommended_timeout": 300,  # 异步任务默认5分钟
+            "reason": f"文档较大 ({complexity_info['total_size_mb']}MB)，预估处理时间{complexity_info['estimated_processing_time_seconds']}秒，建议使用异步任务避免超时"
+        }
+
+    # 添加处理流程图
+    complexity_info["processing_flow"] = {
+        "step1": "文档解析 → 语义分块",
+        "step2": f"模型抽取 (预估 {complexity_info['estimated_chunks']} 个分块)",
+        "step3": "后处理与字段归一化",
+        "step4": "结果合并与输出",
+        "total_steps": 4
+    }
+
+    # 添加分层超时建议
+    complexity_info["timeout_layers"] = {
+        "document_parsing": max(10, complexity_info["estimated_processing_time_seconds"] * 0.1),
+        "model_extraction": max(20, complexity_info["estimated_processing_time_seconds"] * 0.6),
+        "post_processing": max(5, complexity_info["estimated_processing_time_seconds"] * 0.1),
+        "total_timeout": int(complexity_info["estimated_processing_time_seconds"] * 1.5 + 10)
+    }
+
+    return JSONResponse(complexity_info)
+
+
 @app.post('/api/extract/direct')
 async def extract_direct(
     template: UploadFile = File(...),
@@ -495,9 +862,45 @@ async def extract_direct(
     if not input_files:
         raise HTTPException(status_code=400, detail='至少需要上传一个输入文件')
 
-    # 为每个请求创建唯一持久化目录
+    # 1. 智能路由：估算文档复杂度，超过5MB强制使用异步接口
+    complexity_info = await _estimate_document_complexity(input_files, template, llm_mode)
+
+    # 记录复杂度信息
+    logger = logging.getLogger(__name__)
+    logger.info(f"文档复杂度分析: {complexity_info}")
+
+    # 根据用户建议：超过5MB强制使用异步接口
+    if complexity_info["recommendation"] == "async":
+        reason = f"超过阈值：estimated_chunks={complexity_info.get('estimated_chunks')} (>{complexity_info.get('max_chunks_threshold')})"
+        if (complexity_info.get("total_size_mb") or 0) > (complexity_info.get("max_size_mb_threshold") or 0):
+            reason = f"超过阈值：total_size_mb={complexity_info.get('total_size_mb')}MB (>{complexity_info.get('max_size_mb_threshold')}MB)"
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "message": "文档过大，建议使用异步任务接口",
+                "detail": reason,
+                "estimated_chunks": complexity_info["estimated_chunks"],
+                "estimated_processing_time": f"{complexity_info['estimated_processing_time_seconds']}秒",
+                "recommendation": "请使用异步任务接口: POST /api/tasks/create",
+                "complexity_info": complexity_info
+            }
+        )
+
+    # 2. 智能超时调整：根据复杂度动态调整超时时间
+    if total_timeout == 110:  # 使用默认值
+        # 根据预估处理时间调整超时，留出50%的缓冲
+        estimated_time = complexity_info["estimated_processing_time_seconds"]
+        adjusted_timeout = int(estimated_time * 1.5) + 10  # 增加50%缓冲 + 10秒基础
+        adjusted_timeout = min(adjusted_timeout, 300)  # 最大5分钟
+        adjusted_timeout = max(adjusted_timeout, 30)   # 最小30秒
+        logger.info(f"智能超时调整: {total_timeout} -> {adjusted_timeout}秒 (基于预估{estimated_time}秒)")
+        total_timeout = adjusted_timeout
+
+    import tempfile
+    # 为每个请求创建唯一工作目录（可选持久化）
     task_id = uuid.uuid4().hex
-    work_dir = STORAGE_ROOT / task_id
+    storage_root = _get_storage_root() if PERSIST_UPLOADS else None
+    work_dir = (storage_root / task_id) if storage_root else Path(tempfile.mkdtemp(prefix="a23_direct_"))
     work_dir.mkdir(parents=True, exist_ok=True)
 
     # 保存模板文件
@@ -534,6 +937,20 @@ async def extract_direct(
         )
         result["task_id"] = task_id
         result["output_dir"] = str(output_dir)
+
+        # 添加智能路由和复杂度信息
+        result["routing_info"] = {
+            "complexity_analysis": complexity_info,
+            "actual_timeout_used": total_timeout,
+            "timeout_adjusted": total_timeout != 110,  # 是否调整了超时
+            "routing_decision": "direct",  # 已通过检查，使用直接处理
+            "suggestion": "文档大小适中，使用直接处理接口",
+            "estimated_vs_actual": {
+                "estimated_time": complexity_info["estimated_processing_time_seconds"],
+                "actual_time": None,  # 可在后续添加实际处理时间
+            }
+        }
+
         return JSONResponse(result)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f'抽取失败: {str(e)}')
@@ -563,6 +980,41 @@ async def extract_without_template(
     if not input_files:
         raise HTTPException(status_code=400, detail='至少需要上传一个输入文件')
 
+    # 1. 智能路由：估算文档复杂度，超过5MB强制使用异步接口
+    # 无模板文件，只检查输入文件
+    complexity_info = await _estimate_document_complexity(input_files, None, llm_mode)
+
+    # 记录复杂度信息
+    logger = logging.getLogger(__name__)
+    logger.info(f"无模板抽取 - 文档复杂度分析: {complexity_info}")
+
+    # 根据用户建议：超过5MB强制使用异步接口
+    if complexity_info["recommendation"] == "async":
+        reason = f"超过阈值：estimated_chunks={complexity_info.get('estimated_chunks')} (>{complexity_info.get('max_chunks_threshold')})"
+        if (complexity_info.get("total_size_mb") or 0) > (complexity_info.get("max_size_mb_threshold") or 0):
+            reason = f"超过阈值：total_size_mb={complexity_info.get('total_size_mb')}MB (>{complexity_info.get('max_size_mb_threshold')}MB)"
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "message": "文档过大，建议使用异步任务接口",
+                "detail": reason,
+                "estimated_chunks": complexity_info["estimated_chunks"],
+                "estimated_processing_time": f"{complexity_info['estimated_processing_time_seconds']}秒",
+                "recommendation": "请使用异步任务接口: POST /api/tasks/create",
+                "complexity_info": complexity_info
+            }
+        )
+
+    # 2. 智能超时调整：根据复杂度动态调整超时时间
+    if total_timeout == 110:  # 使用默认值
+        # 根据预估处理时间调整超时，留出50%的缓冲
+        estimated_time = complexity_info["estimated_processing_time_seconds"]
+        adjusted_timeout = int(estimated_time * 1.5) + 10  # 增加50%缓冲 + 10秒基础
+        adjusted_timeout = min(adjusted_timeout, 300)  # 最大5分钟
+        adjusted_timeout = max(adjusted_timeout, 30)   # 最小30秒
+        logger.info(f"智能超时调整: {total_timeout} -> {adjusted_timeout}秒 (基于预估{estimated_time}秒)")
+        total_timeout = adjusted_timeout
+
     with tempfile.TemporaryDirectory() as tmpdir:
         tmp_path = Path(tmpdir)
         input_dir = tmp_path / 'inputs'
@@ -576,6 +1028,9 @@ async def extract_without_template(
         try:
             from src.api.direct_extractor import direct_extract
             # instruction 为空时，direct_extract 会自动分析文档内容生成 profile
+            # 创建工作目录用于生成输出文件
+            work_dir = tmp_path / 'output'
+            work_dir.mkdir(parents=True, exist_ok=True)
             result = direct_extract(
                 template_path='',       # 无模板
                 input_dir=str(input_dir),
@@ -583,14 +1038,89 @@ async def extract_without_template(
                 instruction=instruction if instruction.strip() else None,
                 llm_mode=llm_mode,
                 enable_unit_aware=enable_unit_aware,
+                work_dir=work_dir,      # 传递工作目录
                 total_timeout=total_timeout,
                 max_chunks=max_chunks,
                 quiet=quiet,
             )
             result['metadata']['template_generated'] = True
+
+            # 添加智能路由和复杂度信息
+            result["routing_info"] = {
+                "complexity_analysis": complexity_info,
+                "actual_timeout_used": total_timeout,
+                "timeout_adjusted": total_timeout != 110,  # 是否调整了超时
+                "routing_decision": "direct",  # 已通过检查，使用直接处理
+                "suggestion": "文档大小适中，使用直接处理接口",
+                "estimated_vs_actual": {
+                    "estimated_time": complexity_info["estimated_processing_time_seconds"],
+                    "actual_time": None,  # 可在后续添加实际处理时间
+                }
+            }
+
+            # 智能文件输出：如果是结构化类型且有生成的文件，移动到持久化存储并添加下载链接
+            doc_type = result['metadata'].get('doc_type', '')
+            output_file = result.get('output_file')
+            if doc_type in ('structured_table', 'structured_single') and output_file:
+                output_path = Path(output_file)
+                if output_path.exists() and output_path.is_file():
+                    # 创建logger（使用模块级logger）
+                    logger = logging.getLogger(__name__)
+                    try:
+                        # 生成安全的唯一文件名
+                        file_ext = output_path.suffix.lower()
+                        safe_filename = f"{uuid.uuid4().hex}{file_ext}"
+                        target_path = TEMP_STORAGE_DIR / safe_filename
+
+                        # 确保目标目录存在
+                        TEMP_STORAGE_DIR.mkdir(parents=True, exist_ok=True)
+
+                        # 移动文件到持久化存储目录
+                        shutil.move(str(output_path), str(target_path))
+
+                        # 在结果中添加下载链接
+                        result['download_url'] = f'/api/download/temp/{safe_filename}'
+                        logger.info(f"文件已持久化: {safe_filename}, 原始文件: {output_path.name}")
+                    except Exception as e:
+                        # 文件移动失败不影响主流程，只记录警告
+                        logger.warning(f"文件移动失败: {e}")
+                        # 不添加 download_url
+
+            # 始终返回JSON响应
             return JSONResponse(result)
         except Exception as e:
             raise HTTPException(status_code=500, detail=f'抽取失败: {str(e)}')
+
+
+@app.get('/api/download/temp/{filename}')
+def download_temp_file(filename: str):
+    """下载临时生成的文件
+
+    用于 /api/extract/no-template 接口生成的结构化文档文件下载。
+    文件保存在 storage/uploads/temp/ 目录中，超过1小时自动清理。
+    """
+    # 安全性检查：防止路径遍历攻击
+    if '..' in filename or '/' in filename or '\\' in filename:
+        raise HTTPException(status_code=400, detail='无效的文件名')
+
+    file_path = _get_temp_storage_dir() / filename
+    if not file_path.exists():
+        raise HTTPException(status_code=404, detail='文件不存在或已过期')
+
+    # 根据文件扩展名设置Content-Type
+    content_type = 'application/octet-stream'
+    if filename.lower().endswith('.xlsx'):
+        content_type = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+    elif filename.lower().endswith('.docx'):
+        content_type = 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
+    elif filename.lower().endswith('.doc'):
+        content_type = 'application/msword'
+
+    return FileResponse(
+        path=str(file_path),
+        filename=filename,
+        media_type=content_type
+    )
 
 
 # ─────────────────────────────────────────────
@@ -791,6 +1321,8 @@ def get_ingest_records(task_id: str, limit: int = 200):
     }
 
 
+
+
 @app.get('/api/db/health')
 def db_health():
     """检查 MySQL 连接状态"""
@@ -805,4 +1337,6 @@ def db_health():
         'database': MYSQL_DATABASE,
     }
 
-
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)

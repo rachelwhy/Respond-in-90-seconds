@@ -1,5 +1,6 @@
 import argparse
 import json
+import logging
 import os
 import time
 from pathlib import Path
@@ -12,8 +13,81 @@ try:
 except ImportError:
     print("[WARN] dotenv未安装，将使用系统环境变量")
 
+# 导入核心服务
+from src.core.extraction_service import get_extraction_service
+
+# RAG服务 - 简化占位实现
+def load_rag_json(filepath: str) -> dict:
+    """简化版：加载RAG JSON文件"""
+    import json
+    with open(filepath, 'r', encoding='utf-8') as f:
+        return json.load(f)
+
+def extract_retrieved_chunks_from_rag_json(rag_data: dict) -> list:
+    """简化版：从RAG数据提取检索块"""
+    return rag_data.get("retrieved_chunks", [])
+
+def preprocess_retrieved_chunks(chunks: list) -> list:
+    """简化版：预处理检索块"""
+    return chunks
+
+def extract_structured_result_from_rag_json(rag_data: dict) -> dict:
+    """简化版：从RAG数据提取结构化结果"""
+    return rag_data.get("structured_result", {})
+
+def get_rag_service():
+    """简化版：获取RAG服务（占位）"""
+    return None
+
+# 文件服务 - 简化版本
+def ensure_parent_dir(filepath: str):
+    """确保文件父目录存在"""
+    import os
+    os.makedirs(os.path.dirname(os.path.abspath(filepath)), exist_ok=True)
+
+def normalize_input_path(path: str) -> str:
+    """规范化输入路径"""
+    import os
+    return os.path.abspath(os.path.expanduser(path))
+
+def get_file_service():
+    """获取文件服务（占位）"""
+    return None
+
+def ensure_output_dir_empty(output_dir: str):
+    """确保输出目录为空或可以覆盖"""
+    import os
+    import shutil
+    if os.path.exists(output_dir):
+        shutil.rmtree(output_dir)
+    os.makedirs(output_dir, exist_ok=True)
+
+def get_output_file_paths(output_dir: str, basename: str):
+    """获取输出文件路径"""
+    import os
+    return {
+        "excel": os.path.join(output_dir, f"{basename}.xlsx"),
+        "word": os.path.join(output_dir, f"{basename}.docx"),
+        "json": os.path.join(output_dir, f"{basename}.json"),
+    }
+
+# 输出服务 - 简化版本
+def summarize_for_console(records: list, profile: dict) -> str:
+    """简化版：为控制台输出总结"""
+    return f"提取了 {len(records)} 条记录"
+
+def get_output_service():
+    """获取输出服务（占位）"""
+    return None
+
+def format_runtime_summary(runtime: dict) -> str:
+    """简化版：格式化运行时总结"""
+    import json
+    return json.dumps(runtime, ensure_ascii=False, indent=2)
+
 from src.core.profile import generate_profile_from_template, generate_profile_smart, generate_profile_from_document
 from src.config import TARGET_LIMIT_SECONDS
+from src.config import PERSIST_PROFILES
 from src.core.reader import collect_input_bundle, try_internal_structured_extract
 from src.adapters.model_client import call_model
 from src.core.postprocess import (
@@ -24,63 +98,92 @@ from src.core.postprocess import (
     validate_required_fields,
 )
 from src.core.writers import fill_excel_table, fill_excel_vertical, fill_word_table, create_excel_from_records
-from src.core.chunk_merger import smart_merge_records
 
 
-def preprocess_retrieved_chunks(chunks: list) -> list:
-    """规范化 RAG 检索片段格式"""
-    result = []
-    for c in chunks:
-        if isinstance(c, str):
-            result.append({"text": c, "score": 1.0, "source": ""})
-        elif isinstance(c, dict):
-            result.append({"text": c.get("text", str(c)), "score": c.get("score", 1.0), "source": c.get("source", "")})
-    return result
+def _is_debug_enabled() -> bool:
+    v = os.environ.get("A23_DEBUG")
+    if v is None:
+        return False
+    return str(v).strip().lower() in ("1", "true", "yes", "on", "y")
 
+
+_DEBUG = _is_debug_enabled()
+_logger = logging.getLogger(__name__)
+
+
+# 函数简化实现（不再依赖复杂服务模块）
 
 def format_retrieved_chunks(chunks: list, top_k: int = 50) -> str:
-    """将检索片段格式化为 LLM 上下文字符串"""
-    return "\n\n".join(c.get("text", "") for c in chunks[:top_k] if isinstance(c, dict))
+    """将 RAG 检索片段格式化为可用于 LLM 的上下文文本。
+
+    兼容 chunk 为 str / dict 的常见形态；仅做最小格式化与截断。
+    """
+    if not chunks:
+        return ""
+    lines = []
+    for i, ch in enumerate(chunks[: max(1, int(top_k or 50))]):
+        if isinstance(ch, str):
+            text = ch
+        elif isinstance(ch, dict):
+            text = ch.get("text") or ch.get("content") or ch.get("chunk") or ""
+        else:
+            text = str(ch)
+        text = str(text).strip()
+        if not text:
+            continue
+        lines.append(f"[chunk {i+1}]\n{text}")
+    return "\n\n".join(lines).strip()
 
 
-def attach_field_evidence(extracted_raw: dict, retrieved_chunks: list) -> dict:
-    """为每个字段附加检索来源（RAG 场景）"""
-    if not retrieved_chunks or not isinstance(extracted_raw, dict):
+def attach_field_evidence(extracted_raw: dict, retrieved_chunks: list, max_evidence_chars: int = 500) -> dict:
+    """为单记录字段附加检索证据（轻量实现）。
+
+    目标：避免 main.py 运行期因缺失函数崩溃；证据为启发式匹配，找不到则空字符串。
+    """
+    if not isinstance(extracted_raw, dict):
         return {}
+    values = {k: v for k, v in extracted_raw.items() if not str(k).startswith("_")}
     evidence = {}
-    records = extracted_raw.get("records", [extracted_raw])
-    if records:
-        first = records[0] if isinstance(records[0], dict) else {}
-        for field_name in first:
-            for chunk in retrieved_chunks:
-                text = chunk.get("text", "") if isinstance(chunk, dict) else str(chunk)
-                if str(first.get(field_name, "")) in text:
-                    evidence[field_name] = {"source": chunk.get("source", ""), "excerpt": text[:200]}
-                    break
+    if not retrieved_chunks:
+        return evidence
+
+    # 统一 chunk 文本
+    chunk_texts = []
+    for ch in retrieved_chunks:
+        if isinstance(ch, str):
+            t = ch
+        elif isinstance(ch, dict):
+            t = ch.get("text") or ch.get("content") or ch.get("chunk") or ""
+        else:
+            t = str(ch)
+        t = str(t).strip()
+        if t:
+            chunk_texts.append(t)
+
+    for field, raw_val in values.items():
+        v = "" if raw_val is None else str(raw_val).strip()
+        if not v:
+            evidence[field] = ""
+            continue
+        hit = ""
+        for t in chunk_texts:
+            if v in t:
+                hit = t
+                break
+        if hit:
+            # 截断证据，保留命中附近的片段
+            pos = hit.find(v)
+            if pos >= 0:
+                start = max(0, pos - max_evidence_chars // 2)
+                end = min(len(hit), pos + len(v) + max_evidence_chars // 2)
+                snippet = hit[start:end].strip()
+            else:
+                snippet = hit[:max_evidence_chars].strip()
+            evidence[field] = snippet
+        else:
+            evidence[field] = ""
+
     return evidence
-
-
-def load_rag_json(rag_json_path: str) -> dict:
-    with open(rag_json_path, 'r', encoding='utf-8') as f:
-        return json.load(f)
-
-
-def extract_retrieved_chunks_from_rag_json(rag_data: dict) -> list[dict]:
-    if not isinstance(rag_data, dict):
-        return []
-    if isinstance(rag_data.get('retrieved_chunks'), list):
-        return rag_data['retrieved_chunks']
-    result = rag_data.get('result', {})
-    if isinstance(result, dict) and isinstance(result.get('retrieved_chunks'), list):
-        return result['retrieved_chunks']
-    return []
-
-
-def extract_structured_result_from_rag_json(rag_data: dict):
-    if not isinstance(rag_data, dict):
-        return None
-    result = rag_data.get('result')
-    return result if isinstance(result, dict) else None
 
 
 def merge_records_by_key(records: list, key_fields: list = None) -> list:
@@ -95,456 +198,13 @@ def merge_records_by_key(records: list, key_fields: list = None) -> list:
     相同键的记录进行字段级合并：新记录的非空值覆盖旧记录的空值。
     所有关键字段均为空的记录保留并打上 _unkeyed=True 标记。
     """
-    # 使用智能合并函数（向后兼容）
-    # 相似度阈值设为0.98：仅合并几乎完全相同的记录
-    # 避免把不同实体（如不同城市）因为相同字段结构而误合并
-    return smart_merge_records(records, key_fields, similarity_threshold=0.98)
+    # 使用抽取服务的合并函数
+    extraction_service = get_extraction_service()
+    return extraction_service.merge_records_by_key(records, key_fields)
 
 
-def ensure_parent_dir(path_str: str):
-    parent = os.path.dirname(path_str)
-    if parent:
-        os.makedirs(parent, exist_ok=True)
 
 
-def normalize_input_path(path: str) -> str:
-    """标准化输入路径：如果路径是文件，创建临时目录并复制文件；如果是目录，直接返回
-
-    Args:
-        path: 输入路径（文件或目录）
-
-    Returns:
-        目录路径（确保是目录）
-    """
-    import shutil
-    import tempfile
-
-    if not os.path.exists(path):
-        raise FileNotFoundError(f'路径不存在: {path}')
-
-    if os.path.isfile(path):
-        # 创建临时目录
-        temp_dir = tempfile.mkdtemp(prefix='a23_input_')
-        print(f'[INFO] 输入为文件，创建临时目录: {temp_dir}')
-
-        # 复制文件到临时目录
-        file_name = os.path.basename(path)
-        dest_path = os.path.join(temp_dir, file_name)
-        shutil.copy2(path, dest_path)
-        print(f'[INFO] 文件已复制到临时目录: {dest_path}')
-
-        return temp_dir
-    elif os.path.isdir(path):
-        return path
-    else:
-        raise ValueError(f'路径既不是文件也不是目录: {path}')
-
-
-def summarize_for_console(data):
-    import copy
-    if isinstance(data, dict):
-        data = copy.deepcopy(data)
-        # 处理顶层records
-        if isinstance(data.get('records'), list):
-            records = data['records']
-            if len(records) > 20:
-                preview = records[:5]
-                data = {**data, 'records_preview': preview, 'records_count': len(records), 'records': f'<omitted {len(records)} records on console>'}
-
-        # 处理_table_groups中的records
-        if isinstance(data.get('_table_groups'), list):
-            for group in data['_table_groups']:
-                if isinstance(group.get('records'), list):
-                    records = group['records']
-                    if len(records) > 20:
-                        preview = records[:5]
-                        group['records_preview'] = preview
-                        group['records_count'] = len(records)
-                        group['records'] = f'<omitted {len(records)} records on console>'
-
-    return data
-
-
-
-def build_smart_prompt(text: str, profile: dict) -> str:
-    """根据profile和文本构建抽取prompt"""
-    instruction = profile.get("instruction", "请根据字段要求，从文档中提取信息。")
-    fields = profile.get("fields", [])
-    task_mode = profile.get("task_mode", "single_record")
-    template_mode = profile.get("template_mode", "")
-
-    field_names = [item['name'] for item in fields if isinstance(item, dict)]
-
-    # 加载字段别名映射
-    field_aliases_info = {}
-    try:
-        from src.core.alias import load_alias_map
-        alias_map = load_alias_map()
-        for field in fields:
-            if not isinstance(field, dict):
-                continue
-            fn = field['name']
-            aliases = []
-            if fn in alias_map:
-                raw = alias_map[fn]
-                aliases = raw if isinstance(raw, list) else [raw]
-            for canonical, alias_list in alias_map.items():
-                if isinstance(alias_list, list) and fn in alias_list:
-                    aliases.append(canonical)
-                elif alias_list == fn:
-                    aliases.append(canonical)
-            aliases = list(set(a for a in aliases if a and a != fn))
-            if aliases:
-                field_aliases_info[fn] = aliases
-    except Exception:
-        pass
-
-    # ——— 多表格Word模式 ———
-    if template_mode == "word_multi_table":
-        table_specs = profile.get("table_specs", [])
-        required_groups = [(s.get('filter_field', ''), s.get('filter_value', '')) for s in table_specs]
-        tables_info = ""
-        if table_specs:
-            tables_info = "\n模板中的表格分配规则：\n" + "\n".join([
-                f"  表格{s.get('table_index', i)+1}：{s.get('filter_field', '字段')}={s.get('filter_value', '?')}（{s.get('description', '')}）"
-                for i, s in enumerate(table_specs)
-            ])
-        required_groups_str = ""
-        if required_groups:
-            required_groups_str = "\n\n必须包含的分组（每个分组至少要有一条记录）：\n" + "\n".join([
-                f"  - {fv}（用于填写 {ff} 字段）" for ff, fv in required_groups
-            ]) + "\n若文档中某分组数据缺失，仍需在records中为该分组添加记录，城市字段填入分组名，其余字段留空字符串。"
-
-        field_descs = [f'{fn}（别名：{", ".join(field_aliases_info[fn])}）' if fn in field_aliases_info else fn for fn in field_names]
-        example_records = [{fn: f"示例{fn}{i+1}" for fn in field_names} for i in range(3)]
-        return f"""你是一个严格的信息抽取助手。请从文档中提取所有分组记录并按JSON格式输出。
-
-用户指令：{instruction}
-{tables_info}{required_groups_str}
-
-必须提取的字段（字段名必须精确匹配）：
-{json.dumps(field_descs, ensure_ascii=False, indent=2)}
-
-重要要求：
-1. 模板有多个表格，每个表格对应不同的分组（如不同城市）
-2. 请提取文档中所有分组的所有记录，不要遗漏任何一组
-3. 每条记录都必须包含所有指定字段，缺失字段用空字符串""
-4. 字段值直接从文档获取，保持原始格式
-5. 若文档中找不到某分组数据，仍需为该分组输出记录（分组名填入对应字段，其余留空）
-
-输出格式示例：
-{json.dumps({"records": example_records}, ensure_ascii=False, indent=2)}
-
-文档内容：
-{text}
-
-只输出JSON："""
-
-    # ——— 多记录表格模式 ———
-    if task_mode == "table_records":
-        field_descs = [f'{fn}（别名：{", ".join(field_aliases_info[fn])}）' if fn in field_aliases_info else fn for fn in field_names]
-        example_records = [{fn: f"示例{fn}{i+1}" for fn in field_names} for i in range(3)]
-        estimated_count = max(1, len(text) // 200)
-        return f"""你是一个严格的信息抽取助手，必须完全按照要求的格式输出。
-
-用户指令：{instruction}
-
-必须提取的字段（字段名必须精确匹配，括号内是可能出现的别名）：
-{json.dumps(field_descs, ensure_ascii=False, indent=2)}
-
-【重要约束——必须遵守】
-1. 你必须提取文档中所有符合条件的记录，不能只输出前几条示例。
-2. 如果文档中有表格，请逐行处理每一行（从表头后的第一行开始，直到最后一行）。
-3. 如果文档中有编号列表（如 1. ... 2. ...），也请逐条提取。
-4. 输出 records 数组的长度应当等于文档中的实际记录条数，宁可多输出，也不要遗漏。
-5. 文档字符数约为 {len(text)} 字，预估记录数约为 {estimated_count} 条，请参考该数量。
-6. 每条记录应包含所有指定字段，找不到的字段使用空字符串""。
-7. 字段值应直接从文档中获取，保持原始格式。
-
-输出格式（必须包含"records"键）：
-{json.dumps({"records": example_records}, ensure_ascii=False, indent=2)}
-
-文档内容：
-{text}
-
-现在开始抽取，只输出JSON："""
-
-    # ——— 单记录模式 ———
-    field_descs = [f'{fn}（别名：{", ".join(field_aliases_info[fn])}）' if fn in field_aliases_info else fn for fn in field_names]
-    example_json = {fn: "示例值" for fn in field_names}
-    return f"""你是一个严格的信息抽取助手，必须完全按照要求的格式输出。
-
-用户指令：{instruction}
-
-必须提取的字段（字段名必须精确匹配，括号内是可能出现的别名）：
-{json.dumps(field_descs, ensure_ascii=False, indent=2)}
-
-输出要求：
-1. 只输出一个JSON对象，包含上述所有字段
-2. JSON键名必须与字段名完全一致
-3. 找不到字段内容时使用空字符串""
-4. 不要添加任何额外字段
-
-输出格式示例：
-{json.dumps(example_json, ensure_ascii=False, indent=2)}
-
-文档内容：
-{text}
-
-现在开始抽取，只输出JSON："""
-
-
-def extract_with_slicing(text: str, profile: dict, use_model: bool = True, slice_size: int = 2000, overlap: int = 100, show_progress: bool = True, time_budget: int = 110, chunks: list = None, max_chunks: int = 50, logger=None):
-    """使用切片模式进行抽取。优先使用 Docling 语义分块（chunks），回退到字符切片。
-
-    Args:
-        text: 完整文档文本
-        profile: 模板配置
-        use_model: 是否使用模型抽取
-        slice_size: 字符切片大小（仅在无 chunks 时使用）
-        overlap: 字符切片重叠大小（仅在无 chunks 时使用）
-        show_progress: 是否显示进度信息
-        time_budget: 最大允许耗时（秒）
-        chunks: Docling 语义分块列表（每个元素含 type 和 text 字段）
-        max_chunks: 最多处理的 chunk 数量
-        logger: 可选的 Python logger 实例
-
-    Returns:
-        extracted_raw: 抽取结果字典
-        model_output: 模型输出字典
-        slicing_metadata: 切片处理的元数据
-    """
-    import json
-
-    def _log(msg: str):
-        if logger:
-            logger.info(msg)
-        else:
-            print(msg)
-
-    TIME_BUDGET_SECONDS = time_budget
-
-    # ── 优先使用 Docling 语义分块 ──────────────────────────────────────────
-    if chunks:
-        # 过滤掉表格类型的 chunk（表格已通过直读路径处理）
-        text_chunks = [c for c in chunks if c.get("type") != "table"]
-        # 限制处理数量
-        if len(text_chunks) > max_chunks:
-            _log(f'[INFO] 语义分块数 {len(text_chunks)} 超过 max_chunks={max_chunks}，截断处理')
-            text_chunks = text_chunks[:max_chunks]
-
-        if not text_chunks:
-            # 所有 chunk 均为表格，无文本需处理
-            return {}, {}, {"slicing_enabled": False, "slice_count": 0, "mode": "chunks_skipped_all_tables"}
-
-        total_chunks = len(text_chunks)
-
-        # ── 优先尝试 langextract（自动结构化提取） ──
-        try:
-            from src.adapters.langextract_adapter import extract_with_langextract
-            lx_records = extract_with_langextract(
-                text_chunks, profile,
-                time_budget=TIME_BUDGET_SECONDS,
-                quiet=not show_progress,
-            )
-            if lx_records is not None and len(lx_records) > 0:
-                _log(f'[INFO] langextract 提取成功: {len(lx_records)} 条记录')
-                merged = {"records": lx_records}
-                return merged, merged, {
-                    "slicing_enabled": False, "slice_count": total_chunks,
-                    "mode": "langextract", "chunk_count": total_chunks,
-                }
-            elif lx_records is not None:
-                _log('[INFO] langextract 返回空结果，回退到 prompt 方案')
-        except Exception as e:
-            _log(f'[WARN] langextract 不可用: {e}，使用 prompt 方案')
-
-        # ── 回退：手动分块 + prompt + call_model ──
-
-        # 基于总字符数决定是否合并：4000字符以下合并处理，以上逐块处理
-        total_chars = sum(len(c.get("text", "")) for c in text_chunks)
-        combine_threshold = 4000  # 约1000 token，7B模型的安全区间
-
-        if total_chars <= combine_threshold:
-            # 文本量小：拼接后整体处理
-            combined_text = "\n\n".join(c.get("text", "") for c in text_chunks)
-            _log(f'[INFO] 语义块总量 {total_chars} 字符 ≤ {combine_threshold}，合并为单次请求')
-            if use_model:
-                prompt = build_smart_prompt(combined_text, profile)
-                raw = call_model(prompt)
-                if isinstance(raw, dict) and "records" in raw:
-                    model_output = raw
-                elif isinstance(raw, dict):
-                    model_output = {"records": [raw]}
-                else:
-                    model_output = {"records": []}
-            else:
-                model_output = {}
-            extracted_raw = model_output
-            return extracted_raw, model_output, {
-                "slicing_enabled": False, "slice_count": 1, "mode": "chunks_combined",
-                "chunk_count": total_chunks
-            }
-
-        # 文本量大：逐块处理，每块独立提取后合并
-        _log(f'[INFO] 语义分块模式：共 {total_chunks} 个文本块，{total_chars} 字符，逐块处理')
-        all_model_outputs = []
-        slice_start_time = time.perf_counter()
-
-        for i, chunk in enumerate(text_chunks):
-            elapsed = time.perf_counter() - slice_start_time
-            if elapsed > TIME_BUDGET_SECONDS:
-                _log(f'[WARN] 抽取时间已达 {elapsed:.1f}s，跳过剩余 {total_chunks - i} 个块')
-                break
-            chunk_text = chunk.get("text", "")
-            if not chunk_text.strip():
-                continue
-            if show_progress:
-                _log(f'[进度] 处理语义块 {i+1}/{total_chunks} ({len(chunk_text)} 字符)...')
-            if use_model:
-                try:
-                    prompt = build_smart_prompt(chunk_text, profile)
-                    raw = call_model(prompt)
-                    elapsed_after = time.perf_counter() - slice_start_time
-                    _log(f'[INFO] 块 {i+1} 模型调用完成 (累计 {elapsed_after:.1f}s)')
-                    if isinstance(raw, dict) and "records" in raw:
-                        seg_output = raw
-                    elif isinstance(raw, dict):
-                        seg_output = {"records": [raw]}
-                    else:
-                        seg_output = {"records": []}
-                    all_model_outputs.append(seg_output)
-                except TimeoutError:
-                    _log(f'[WARN] 块 {i+1} 超时，返回已收集结果')
-                    break
-                except Exception as e:
-                    _log(f'[WARN] 块 {i+1} 抽取失败: {e}')
-                    all_model_outputs.append({"records": []})
-
-        all_records = []
-        field_names = [f['name'] for f in profile.get('fields', []) if isinstance(f, dict)]
-        for out in all_model_outputs:
-            if isinstance(out, dict) and "records" in out:
-                chunk_recs = out["records"]
-            elif isinstance(out, dict) and out:
-                chunk_recs = [out]
-            else:
-                chunk_recs = []
-            # 展平嵌套JSON（LLM可能返回 {"城市A": {...}, "城市B": {...}} 而非 records 数组）
-            if chunk_recs and field_names:
-                from src.core.postprocess import _flatten_nested_records
-                chunk_recs = _flatten_nested_records(chunk_recs, field_names)
-            all_records.extend(chunk_recs)
-
-        # 关键字段去重（从 profile 读取 dedup_key_fields）
-        key_fields = profile.get("dedup_key_fields") or None
-        if all_records:
-            all_records = merge_records_by_key(all_records, key_fields)
-
-        merged_model_output = {"records": all_records} if all_records else {}
-        return merged_model_output, merged_model_output, {
-            "slicing_enabled": True, "slice_count": total_chunks,
-            "mode": "semantic_chunks", "chunk_count": total_chunks,
-        }
-
-    # ── 回退：字符切片模式 ─────────────────────────────────────────────────
-    SLICE_THRESHOLD = 2000
-    MAX_CHUNK_SIZE = slice_size
-    OVERLAP_SIZE = overlap
-
-    if len(text) <= SLICE_THRESHOLD:
-        if use_model:
-            prompt = build_smart_prompt(text, profile)
-            raw = call_model(prompt)
-            if isinstance(raw, dict) and "records" in raw:
-                model_output = raw
-            elif isinstance(raw, dict):
-                model_output = {"records": [raw]}
-            else:
-                model_output = {"records": []}
-        else:
-            model_output = {}
-        extracted_raw = model_output
-        return extracted_raw, model_output, {"slicing_enabled": False, "slice_count": 1, "mode": "direct"}
-
-    # 需要切片
-    _log(f'[INFO] 文档内容过长 ({len(text)} 字符)，启用字符切片模式')
-    _log(f'[INFO] 切片配置: 阈值={SLICE_THRESHOLD}, 分块大小={MAX_CHUNK_SIZE}, 重叠={OVERLAP_SIZE}')
-
-    # 生成字符切片
-    char_chunks = []
-    start = 0
-    while start < len(text):
-        end = min(start + MAX_CHUNK_SIZE, len(text))
-        char_chunks.append({"text": text[start:end], "metadata": {"start": start, "end": end}})
-        if end >= len(text):
-            break
-        start = end - OVERLAP_SIZE
-
-    _log(f'[INFO] 文档已切分为 {len(char_chunks)} 个片段')
-
-    all_model_outputs = []
-    total_segments = len(char_chunks)
-    slice_start_time = time.perf_counter()
-
-    for i, segment in enumerate(char_chunks):
-        elapsed = time.perf_counter() - slice_start_time
-        if elapsed > TIME_BUDGET_SECONDS:
-            _log(f'[WARN] 抽取时间已达 {elapsed:.1f}s，跳过剩余 {total_segments - i} 个片段（已覆盖前 {i} 个）')
-            break
-        segment_text = segment["text"]
-        if show_progress:
-            _log(f'[进度] 处理第 {i+1}/{total_segments} 个片段 ({len(segment_text)} 字符)...')
-
-        if use_model:
-            try:
-                prompt = build_smart_prompt(segment_text, profile)
-                raw = call_model(prompt)
-                elapsed_after = time.perf_counter() - slice_start_time
-                _log(f'[INFO] 片段 {i+1} 模型调用完成 (累计 {elapsed_after:.1f}s)')
-                if isinstance(raw, dict) and "records" in raw:
-                    seg_output = raw
-                elif isinstance(raw, dict):
-                    seg_output = {"records": [raw]}
-                else:
-                    seg_output = {"records": []}
-                all_model_outputs.append(seg_output)
-                _log(f'[INFO] 片段 {i+1} 抽取完成，获取 {len(seg_output.get("records", []))} 条记录')
-            except TimeoutError:
-                _log(f'[WARN] 片段 {i+1} 超时，返回已收集结果')
-                break
-            except Exception as e:
-                _log(f'[WARN] 片段 {i+1} 抽取失败: {e}')
-                all_model_outputs.append({"records": []})
-
-    all_records = []
-    field_names = [f['name'] for f in profile.get('fields', []) if isinstance(f, dict)]
-    for model_out in all_model_outputs:
-        if isinstance(model_out, dict) and "records" in model_out:
-            chunk_recs = model_out["records"]
-        elif isinstance(model_out, dict) and model_out:
-            chunk_recs = [model_out]
-        else:
-            chunk_recs = []
-        # 展平嵌套JSON
-        if chunk_recs and field_names:
-            from src.core.postprocess import _flatten_nested_records
-            chunk_recs = _flatten_nested_records(chunk_recs, field_names)
-        all_records.extend(chunk_recs)
-
-    merged_model_output = {"records": all_records} if all_records else {}
-    extracted_raw = merged_model_output
-
-    slicing_metadata = {
-        "slicing_enabled": True,
-        "slice_threshold": SLICE_THRESHOLD,
-        "slice_count": len(char_chunks),
-        "max_chunk_size": MAX_CHUNK_SIZE,
-        "overlap_size": OVERLAP_SIZE,
-        "mode": "char_slice",
-    }
-
-    return extracted_raw, merged_model_output, slicing_metadata
 
 
 def main():
@@ -575,14 +235,17 @@ def main():
                        help='[兼容参数] 字符切片大小，仅在无语义分块时使用')
     parser.add_argument('--overlap', type=int, default=200,
                        help='[兼容参数] 字符切片重叠大小，仅在无语义分块时使用')
-    parser.add_argument('--llm-mode', type=str, default='full', choices=['full', 'supplement'],
-                       help='LLM抽取模式：full=始终全文抽取（默认），supplement=仅补充缺失字段')
+    parser.add_argument('--llm-mode', type=str, default='full', choices=['full', 'supplement', 'off'],
+                       help='LLM抽取模式：full=始终全文抽取（默认），supplement=仅补充缺失字段，off=仅规则/结构化抽取（不调用模型）')
     parser.add_argument('--total-timeout', type=int, default=180,
                        help='整体抽取最大允许时间（秒，默认180）')
     parser.add_argument('--output-basename', type=str, default='',
                        help='输出文件basename（默认为空，使用输入文件名）')
 
     args = parser.parse_args()
+
+    # 获取抽取服务实例
+    extraction_service = get_extraction_service()
 
     template_path = args.template.strip() if args.template else None
 
@@ -604,20 +267,21 @@ def main():
     if not template_path and not args.template_description:
         print('[INFO] 未提供模板文件或描述，系统将在文档加载后自动分析最优字段结构')
 
-    # 模型可用性检查（必须有可用模型才能运行）
-    print('[INFO] 检查模型可用性...')
-    try:
-        test_prompt = "请回复一个简单的JSON：{\"status\": \"ok\"}"
-        test_result = call_model(test_prompt)
-        print('[INFO] 模型可用性检查通过')
-    except Exception as e:
-        print(f'[ERROR] 模型不可用: {e}')
-        print('[ERROR] 系统需要可用的AI模型才能运行。请配置以下任一模型：')
-        print('  1. Ollama 本地模型: 启动 ollama serve 并拉取模型 (ollama pull qwen2.5:7b)')
-        print('  2. DeepSeek API: 在 .env 中设置 A23_MODEL_TYPE=deepseek 和 A23_DEEPSEEK_API_KEY')
-        print('  3. OpenAI 兼容 API: 在 .env 中设置 A23_MODEL_TYPE=openai 和相关配置')
-        print('  网页端可在"模型配置"页面中切换和测试模型连接。')
-        return
+    # 模型可用性检查（llm-mode=off 时跳过）
+    if args.llm_mode != "off":
+        print('[INFO] 检查模型可用性...')
+        try:
+            test_prompt = "请回复一个简单的JSON：{\"status\": \"ok\"}"
+            _ = call_model(test_prompt)
+            print('[INFO] 模型可用性检查通过')
+        except Exception as e:
+            print(f'[ERROR] 模型不可用: {e}')
+            print('[ERROR] 当前模式需要可用的AI模型才能运行。请配置以下任一模型：')
+            print('  1. Ollama 本地模型: 启动 ollama serve 并拉取模型 (ollama pull qwen2.5:7b)')
+            print('  2. DeepSeek API: 在 .env 中设置 A23_MODEL_TYPE=deepseek 和 A23_DEEPSEEK_API_KEY')
+            print('  3. OpenAI 兼容 API: 在 .env 中设置 A23_MODEL_TYPE=openai 和相关配置')
+            print('  网页端可在"模型配置"页面中切换和测试模型连接。')
+            return
 
 
     # 标准化输入路径
@@ -640,15 +304,16 @@ def main():
         raise ValueError(f'输出目录非空：{args.output_dir}。请使用 --overwrite-output 参数覆盖，或选择其他目录。')
     os.makedirs(args.output_dir, exist_ok=True)
 
-    # 确定profile保存路径
-    if args.profile_output.strip():
-        profile_path = args.profile_output.strip()
-    elif template_path:
-        profile_path = f"profiles/{Path(template_path).stem}_auto.json"
-    else:
-        profile_path = os.path.join(args.output_dir, "llm_profile_auto.json")
-
-    ensure_parent_dir(profile_path)
+    # 确定profile保存路径（默认不落盘；调试时用 A23_PERSIST_PROFILES=true 开启）
+    profile_path = ""
+    if PERSIST_PROFILES:
+        if args.profile_output.strip():
+            profile_path = args.profile_output.strip()
+        elif template_path:
+            profile_path = f"profiles/{Path(template_path).stem}_auto.json"
+        else:
+            profile_path = os.path.join(args.output_dir, "llm_profile_auto.json")
+        ensure_parent_dir(profile_path)
 
     # 输出文件命名：优先使用--output-basename，否则基于输入文件名
     base_name = args.output_basename.strip() if args.output_basename else input_base_name
@@ -738,13 +403,15 @@ def main():
             profile['enable_multi_template'] = False
             profile['use_ai_allocation'] = False
 
-        with open(profile_path, 'w', encoding='utf-8') as f:
-            json.dump(profile, f, ensure_ascii=False, indent=2)
+        if PERSIST_PROFILES and profile_path:
+            with open(profile_path, 'w', encoding='utf-8') as f:
+                json.dump(profile, f, ensure_ascii=False, indent=2)
         runtime['generate_profile_seconds'] = round(time.perf_counter() - step_start, 3)
 
         print('=== 自动生成的 profile ===')
         print(json.dumps(profile, ensure_ascii=False, indent=2))
-        print(f'\n已保存 profile：{profile_path}')
+        if PERSIST_PROFILES and profile_path:
+            print(f'\n已保存 profile：{profile_path}')
 
         step_start = time.perf_counter()
         loaded_bundle = collect_input_bundle(args.input_dir) if os.path.exists(args.input_dir) else {'documents': [], 'all_text': '', 'warnings': []}
@@ -782,8 +449,9 @@ def main():
                 profile['enable_multi_template'] = False
                 profile['use_ai_allocation'] = False
                 print(f'[INFO] 文档专属profile生成完成，字段数: {len(profile.get("fields", []))}')
-                with open(profile_path, 'w', encoding='utf-8') as f:
-                    json.dump(profile, f, ensure_ascii=False, indent=2)
+                if PERSIST_PROFILES and profile_path:
+                    with open(profile_path, 'w', encoding='utf-8') as f:
+                        json.dump(profile, f, ensure_ascii=False, indent=2)
             except Exception as e:
                 print(f'[WARN] 文档专属profile生成失败，使用原始profile: {e}')
 
@@ -805,8 +473,9 @@ def main():
                     # 如果有用户指令，覆盖 instruction
                     if args.instruction and args.instruction.strip():
                         profile['instruction'] = args.instruction.strip()
-                    with open(profile_path, 'w', encoding='utf-8') as f:
-                        json.dump(profile, f, ensure_ascii=False, indent=2)
+                    if PERSIST_PROFILES and profile_path:
+                        with open(profile_path, 'w', encoding='utf-8') as f:
+                            json.dump(profile, f, ensure_ascii=False, indent=2)
                     print('=== 自动分析 profile ===')
                     print(json.dumps(profile, ensure_ascii=False, indent=2))
             except Exception as e:
@@ -891,10 +560,10 @@ def main():
                 all_semantic_chunks.extend(doc.get("chunks", []))
 
             # 使用切片感知抽取（优先语义分块，回退字符切片）
-            extracted_raw, model_output, slicing_metadata = extract_with_slicing(
+            extracted_raw, model_output, slicing_metadata = extraction_service.extract_with_slicing(
                 text=context_for_llm,
                 profile=profile,
-                use_model=True,
+                use_model=(args.llm_mode != "off"),
                 slice_size=args.slice_size,
                 overlap=args.overlap,
                 show_progress=not args.quiet,
@@ -912,7 +581,7 @@ def main():
                 print(f'[INFO] 切片数量: {slicing_metadata.get("slice_count", 1)}')
 
             print('=== 模型抽取结果 ===')
-            print(json.dumps(summarize_for_console(model_output), ensure_ascii=False, indent=2))
+            print(json.dumps(summarize_for_console(model_output, profile), ensure_ascii=False, indent=2))
 
             temp_final_data = process_by_profile(extracted_raw, profile)
             missing_before_retry = validate_required_fields(temp_final_data, profile)
@@ -936,7 +605,7 @@ def main():
         if missing_required_fields:
             print(f'[WARN] 最终结果仍缺失关键字段：{missing_required_fields}')
         print('\n=== 最终格式化结果 ===')
-        print(json.dumps(summarize_for_console(final_data), ensure_ascii=False, indent=2))
+        print(json.dumps(summarize_for_console(final_data, profile), ensure_ascii=False, indent=2))
 
         debug_result = build_debug_result(extracted_raw, profile)
         field_evidence = attach_field_evidence(extracted_raw, retrieved_chunks) if profile.get('task_mode') == 'single_record' and retrieved_chunks else {}
@@ -1032,7 +701,7 @@ def main():
         report_bundle = {
             'meta': {
                 'report_type': 'integrated_output_bundle',
-                'profile_path': profile_path,
+                'profile_path': profile_path if (PERSIST_PROFILES and profile_path) else "",
                 'profile_name': profile.get('report_name', ''),
                 'template_path': profile.get('template_path', ''),
                 'task_mode': profile.get('task_mode', 'single_record'),

@@ -8,9 +8,25 @@ uvicorn api_server:app --host 0.0.0.0 --port 8000
 Swagger 文档：
 - http://127.0.0.1:8000/docs
 
+## 环境与异步任务（当前行为）
+
+以下由 `src/config.py` 读取环境变量（`A23_*`），**不改变接口路径**，仅影响是否落盘与清理：
+
+| 变量 | 含义 |
+|------|------|
+| `A23_ENABLE_TASKS` | 为 `false` 时，`/api/tasks/*` 返回 404 |
+| `A23_PERSIST_UPLOADS` | 是否持久化上传文件 |
+| `A23_PERSIST_PROFILES` | 是否自动写入生成的 profile |
+| `A23_TASK_RETENTION_HOURS` / `A23_UPLOAD_RETENTION_HOURS` / `A23_TEMP_RETENTION_HOURS` | 本地目录保留时长（小时） |
+
+**异步任务 `POST /api/tasks/create`**：后台线程通过子进程执行 `main.py`，并向子进程传入 `A23_MODEL_TYPE` 等环境变量；子进程通常设置 **`PYTHONUNBUFFERED=1`**，便于 `extraction.log` 实时刷新。  
+外层 watchdog 超时约为 **`total_timeout`（表单参数，默认 110）+ 300 秒** 缓冲，用于防止子进程无限挂死；**主流程内部超时**仍由 `main.py --total-timeout` 控制。
+
 ## 认证系统（已移除）
 
 > **注意**: 根据后端要求，AI端不处理鉴权，所有接口均为公开接口。以下认证系统文档仅供参考（历史版本）。
+
+> **建议**：若不需要保留历史说明，可删除本段 JWT 示例，仅保留本段首句，避免与「公开接口」矛盾。
 
 系统使用JWT令牌进行认证，所有API端点（除健康检查和登录外）都需要有效的Bearer Token。
 

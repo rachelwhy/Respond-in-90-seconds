@@ -207,7 +207,8 @@ def _retrieve_from_chunks(
         return scored[:top_k]
 
     except Exception as e:
-        print(f"[WARN] 向量检索不可用，退回 BM25: {e}")
+        import logging
+        logging.getLogger(__name__).warning("向量检索不可用，退回 BM25: %s", e)
 
     # ── BM25 fallback ──────────────────────────────────────────
     query_tokens = _tokenize(question)

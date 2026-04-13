@@ -82,7 +82,8 @@ def fill_excel_vertical(template_path: str, output_path: str, data: dict):
         alias_map = load_alias_map()
         reverse_alias_map = build_reverse_alias_map(alias_map)
     except Exception as e:
-        print(f'[WARN] 字段别名映射加载失败: {e}，将继续使用原始字段名匹配')
+        import logging
+        logging.getLogger(__name__).warning("字段别名映射加载失败: %s，将继续使用原始字段名匹配", e)
 
     wb = load_workbook(template_path)
     ws = wb.active
@@ -122,7 +123,8 @@ def fill_excel_table(template_path: str, output_path: str, records, header_row: 
         alias_map = load_alias_map()
         reverse_alias_map = build_reverse_alias_map(alias_map)
     except Exception as e:
-        print(f'[WARN] 字段别名映射加载失败: {e}，将继续使用原始字段名匹配')
+        import logging
+        logging.getLogger(__name__).warning("字段别名映射加载失败: %s，将继续使用原始字段名匹配", e)
 
     records, _ = _normalize_records(records)
 
@@ -232,7 +234,12 @@ def fill_word_table(template_path: str, output_path: str, records, table_index: 
                     group_records = json.loads(group_records)
                 except:
                     # 如果解析失败，跳过这个表格
-                    print(f'[WARN] 表{idx}的records是字符串且无法解析为JSON: {group_records[:100]}')
+                    import logging
+                    logging.getLogger(__name__).warning(
+                        "表%s的records是字符串且无法解析为JSON: %s",
+                        idx,
+                        str(group_records)[:100],
+                    )
                     continue
             _fill_single_word_table(doc.tables[idx], group_records, header_row=header_row, start_row=start_row)
         doc.save(output_path)
@@ -253,7 +260,8 @@ def _fill_single_word_table(table, records, header_row: int = 0, start_row: int 
         alias_map = load_alias_map()
         reverse_alias_map = build_reverse_alias_map(alias_map)
     except Exception as e:
-        print(f'[WARN] 字段别名映射加载失败: {e}，将继续使用原始字段名匹配')
+        import logging
+        logging.getLogger(__name__).warning("字段别名映射加载失败: %s，将继续使用原始字段名匹配", e)
 
     header_map = {}
     header_cells = table.rows[header_row].cells
@@ -279,7 +287,13 @@ def _fill_single_word_table(table, records, header_row: int = 0, start_row: int 
         row_cells = table.rows[row_idx].cells
         # 确保record是字典
         if not isinstance(record, dict):
-            print(f'[WARN] 记录{i}不是字典类型: {type(record)}, 值: {str(record)[:100]}')
+            import logging
+            logging.getLogger(__name__).warning(
+                "记录%s不是字典类型: %s, 值: %s",
+                i,
+                type(record),
+                str(record)[:100],
+            )
             continue
 
         # 遍历表头字段，查找对应的记录值（支持字段别名映射）

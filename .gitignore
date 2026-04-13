@@ -48,12 +48,19 @@ logs/
 test_run.log
 
 # Project specific
-storage/
+storage/*
+!storage/.gitkeep
 profiles/*_auto.json
 profiles/auto/
 .harness/
-harness/
+harness/*
+!harness/entry.md
 .claude/
+
+# Local / tooling noise (keep repo lean)
+.pytest_cache/
+uv_err.txt
+.backup/
 
 # Test data (optional, include if you want to ignore test inputs)
 命令行端测试/

@@ -15,30 +15,34 @@ A23赛题算法后端：基于RAG的异构文档理解与信息抽取系统
 - **RAG集成**：可选LangChain集成，自动降级到手写RAG
 - **工程鲁棒性**：总超时控制、持久化缓存、任务状态管理、优雅降级
 
-## 目录结构
+## 目录结构（与当前仓库一致）
 
-Respond-in-90-seconds/
-├── src/                    # 源代码
-│   ├── algorithm/         # 算法接口层
-│   ├── pipeline/          # 流程编排器
-│   ├── extractors/        # 字段抽取器
-│   ├── engine/           # 引擎层（模型、文档、检索）
-│   ├── parsers/          # 多格式文档解析器
-│   ├── knowledge/        # 领域知识库
-│   ├── config.py         # 配置管理
-│   └── runtime_config.py # 运行时配置
-├── tests/                # 测试用例
-├── scripts/             # 工具脚本
-├── profiles/            # 模板配置文件
-├── storage/             # 上传文件存储
-├── requirements.txt     # Python依赖
-├── main.py             # 命令行入口
-├── api_server.py       # HTTP API入口
-├── CLAUDE.md           # Claude代码助手指南
-├── HOW_TO_USE_BATCH.md # 批量使用指南
-├── HTTP_API_USAGE.md   # HTTP API使用文档
-├── install_windows_dependencies.bat  # Windows一键安装脚本
-└── start_api_windows.bat             # Windows启动脚本
+> 详细技术流与模块说明见 [A23_TECHNICAL_FLOW.md](A23_TECHNICAL_FLOW.md)；优化与文档勘误见 [PROJECT_OPTIMIZATION_REPORT_2026.md](PROJECT_OPTIMIZATION_REPORT_2026.md)。
+
+```
+Respond in 90 seconds_A23/
+├── main.py                 # CLI 入口
+├── api_server.py           # FastAPI HTTP 入口
+├── src/
+│   ├── adapters/           # 模型、Docling、解析器工厂、langextract 适配等
+│   ├── api/                # direct_extractor、task_manager、qna_service
+│   ├── core/               # 抽取服务、后处理、reader、writers、profile 等
+│   ├── knowledge/          # 别名与归一化等知识资源
+│   └── config.py
+├── third_party/            # 可选：内嵌第三方库（如 langextract）
+├── tests/                  # 单元 / 集成测试
+├── scripts/                # 工具脚本
+├── profiles/               # 模板 profile 示例
+├── storage/                # API 任务与上传持久化（可按环境忽略）
+├── requirements.txt
+├── CLAUDE.md
+├── A23_TECHNICAL_FLOW.md
+├── HTTP_API_USAGE.md
+├── HOW_TO_USE_BATCH.md
+├── PROJECT_OPTIMIZATION_REPORT_2026.md
+├── install_windows_dependencies.bat
+└── start_api_windows.bat
+```
 
 ## 安装
 
@@ -143,15 +147,25 @@ uvicorn api_server:app --host 0.0.0.0 --port 8000
 
 启动服务后访问：http://localhost:8000/docs
 
-| 接口                 | 方法 | 说明             |
-| -------------------- | ---- | ---------------- |
-| /api/extract         | POST | 提交文档抽取任务 |
-| /api/ask             | POST | 提交问答任务     |
-| /api/tasks/{task_id} | GET  | 查询任务结果     |
-| /api/tasks           | GET  | 查看所有任务     |
-| /api/health          | GET  | 健康检查         |
+| 接口 | 方法 | 说明 |
+|------|------|------|
+| `/api/health` | GET | 健康检查 |
+| `/api/tasks` | GET | 任务列表（受 `A23_ENABLE_TASKS` 控制） |
+| `/api/tasks/create` | POST | 创建异步任务（multipart） |
+| `/api/tasks/{task_id}` | GET | 任务状态与输出路径 |
+| `/api/tasks/{task_id}/result` | GET | 任务结果摘要 |
+| `/api/extract/direct` | POST | 同步直接抽取 |
+| `/api/extract/no-template` | POST | 无模板抽取 |
+| `/api/qna/ask` | POST | 文档问答（可选 LangChain） |
 
-详细API文档请参考 [HTTP_API_USAGE.md](HTTP_API_USAGE.md)
+详细说明见 [HTTP_API_USAGE.md](HTTP_API_USAGE.md)
+
+## 行为与环境变量（API / 任务）
+
+- **`A23_ENABLE_TASKS`**：为 `false` 时 `/api/tasks/*` 不可用。
+- **`A23_PERSIST_UPLOADS` / `A23_PERSIST_PROFILES`**：是否持久化上传与自动生成 profile。
+- **`A23_TASK_RETENTION_HOURS` 等**：任务与上传目录清理策略（小时）。
+- 异步任务由子进程执行 `main.py`；子进程设置 **`PYTHONUNBUFFERED=1`** 便于日志落盘。外层 watchdog 约为 **`total_timeout + 300` 秒**（缓冲），与 `main.py --total-timeout` 配合使用。
 
 ## Profile配置示例
 

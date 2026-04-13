@@ -18,13 +18,35 @@ class TextParser(BaseParser):
 
     def parse(self, path: Path) -> Dict[str, Any]:
         text = safe_read_text(path)
+        paragraphs = self._split_paragraphs(text)
+
+        # 生成 chunks（与 DoclingParser 保持一致）
+        chunks = []
+        current_chunk = []
+        current_len = 0
+        CHUNK_MAX = 1500
+
+        for para in paragraphs:
+            para_len = len(para)
+            if current_len + para_len > CHUNK_MAX and current_chunk:
+                chunks.append({"type": "text", "text": "\n".join(current_chunk)})
+                current_chunk = [para]
+                current_len = para_len
+            else:
+                current_chunk.append(para)
+                current_len += para_len
+
+        if current_chunk:
+            chunks.append({"type": "text", "text": "\n".join(current_chunk)})
+
         return {
             'parser_type': self.parser_type,
             'type': 'text',
             'path': str(path),
             'file_name': path.name,
-            'paragraphs': self._split_paragraphs(text),
+            'paragraphs': paragraphs,
             'text': text,
+            'chunks': chunks,  # 新增
         }
 
     @staticmethod

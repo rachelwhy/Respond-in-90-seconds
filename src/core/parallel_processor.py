@@ -303,9 +303,10 @@ def should_use_parallel(chunks: List[Dict[str, Any]], min_chunks: int = 3) -> bo
     if len(chunks) < min_chunks:
         return False
 
-    # 检查环境变量
-    import os
-    if os.environ.get("A23_DISABLE_PARALLEL", "").lower() in ("1", "true", "yes"):
+    # 检查配置（通过配置管理器）
+    from src.core.config_manager import get_config_manager
+    _config = get_config_manager()
+    if _config.get_bool("DISABLE_PARALLEL", False):
         return False
 
     # 检查分块类型

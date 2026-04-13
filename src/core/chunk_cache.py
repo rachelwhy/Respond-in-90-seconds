@@ -68,7 +68,17 @@ class ChunkCache:
     """
 
     def __init__(self, config: Optional[ChunkCacheConfig] = None):
-        self.config = config or ChunkCacheConfig()
+        if config is None:
+            # 尝试从去重配置获取默认值
+            try:
+                from src.core.deduplication_config import get_similarity_threshold
+                threshold = get_similarity_threshold("chunk_cache")
+                config = ChunkCacheConfig(similarity_threshold=threshold)
+            except ImportError:
+                # 如果去重配置模块不可用，使用默认配置
+                config = ChunkCacheConfig()
+
+        self.config = config
         self._cache_dir = Path(self.config.cache_dir)
         self._cache_dir.mkdir(parents=True, exist_ok=True)
 

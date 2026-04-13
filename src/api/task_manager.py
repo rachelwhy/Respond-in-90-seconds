@@ -11,17 +11,30 @@
 from __future__ import annotations
 
 import json
+import logging
+import os
 import subprocess
 import sys
 import threading
 import time
 import uuid
+from queue import Queue, Empty
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
 from typing import Dict, List, Optional, Any
+from src.config import TASK_RETENTION_HOURS
+
+# 导入新的进程内任务执行器
+try:
+    from src.api.task_executor import get_task_executor, TaskExecutionError, NEW_ARCHITECTURE_AVAILABLE
+    IN_PROCESS_EXECUTION_AVAILABLE = True
+except ImportError as e:
+    import logging
+    logging.getLogger(__name__).warning(f"进程内任务执行器不可用: {e}")
+    IN_PROCESS_EXECUTION_AVAILABLE = False
+    NEW_ARCHITECTURE_AVAILABLE = False
 
 STORAGE_ROOT = Path("storage/tasks")
-STORAGE_ROOT.mkdir(parents=True, exist_ok=True)
 
 
 @dataclass
@@ -48,11 +61,13 @@ class TaskManager:
         self._tasks: Dict[str, TaskInfo] = {}
         self._lock = threading.Lock()
         self._restore_from_disk()
+        self._start_cleanup_thread()
 
     # ── 对外接口 ──────────────────────────────────────────────────────────────
 
     def create_task_workspace(self, template_name: str, input_files: List[str]) -> TaskInfo:
         """创建任务工作目录，返回 TaskInfo"""
+        STORAGE_ROOT.mkdir(parents=True, exist_ok=True)
         task_id = uuid.uuid4().hex[:12]
         task_dir = STORAGE_ROOT / task_id
         (task_dir / "uploads" / "template").mkdir(parents=True, exist_ok=True)
@@ -97,12 +112,21 @@ class TaskManager:
         output_dir = info.task_dir / "output"
         result = {}
         for f in output_dir.iterdir():
-            if f.suffix == ".json" and "report_bundle" in f.name:
-                result["report_bundle"] = str(f)
-            elif f.suffix == ".xlsx":
+            name = f.name.lower()
+            if f.suffix == ".xlsx":
+                # 兼容多命名：excel / result_xlsx
                 result["excel"] = str(f)
+                result["result_xlsx"] = str(f)
             elif f.suffix == ".json":
-                result["json"] = str(f)
+                # 兼容 main.py 的输出命名：*_result.json / *_result_report.json
+                if "report_bundle" in name or name.endswith("_result_report.json"):
+                    result["report_bundle"] = str(f)
+                elif name.endswith("_result.json"):
+                    result["json"] = str(f)
+                    result["result_json"] = str(f)
+                else:
+                    # 兜底：不要覆盖已识别的 result_json/report_bundle
+                    result.setdefault("json", str(f))
         return result
 
     def read_log(self, task_id: str, limit: int = 200) -> List[str]:
@@ -130,6 +154,38 @@ class TaskManager:
             pass
         return True
 
+    def _start_cleanup_thread(self):
+        """后台清理线程：删除超过保留时长的任务目录。
+
+        目标：生产环境“省心”，避免 storage/tasks 无限增长。
+        """
+        def _loop():
+            while True:
+                try:
+                    retention = max(1, int(TASK_RETENTION_HOURS))
+                    cutoff = time.time() - retention * 3600
+                    if STORAGE_ROOT.exists():
+                        for task_dir in STORAGE_ROOT.iterdir():
+                            if not task_dir.is_dir():
+                                continue
+                            try:
+                                mtime = task_dir.stat().st_mtime
+                                if mtime < cutoff:
+                                    tid = task_dir.name
+                                    # 从内存中移除（若存在）
+                                    with self._lock:
+                                        self._tasks.pop(tid, None)
+                                    import shutil
+                                    shutil.rmtree(task_dir, ignore_errors=True)
+                            except Exception:
+                                pass
+                except Exception:
+                    pass
+                time.sleep(3600)
+
+        t = threading.Thread(target=_loop, daemon=True)
+        t.start()
+
     # ── 内部实现 ──────────────────────────────────────────────────────────────
 
     def _run_task(self, task_id: str, template_path: Optional[Path], input_dir: Path):
@@ -153,6 +209,7 @@ class TaskManager:
             model_type = meta.get("model_type", "")
             template_mode = meta.get("template_mode", "auto")
             template_description = meta.get("template_description", "")
+            instruction = meta.get("note", "")  # 网页端传入的抽取指令
             llm_mode = meta.get("llm_mode", "full")
             total_timeout = meta.get("total_timeout", 110)
             max_chunks = meta.get("max_chunks", 50)
@@ -166,60 +223,190 @@ class TaskManager:
                 first_file = saved_inputs[0]
                 output_basename = Path(first_file).stem
 
-            # 构建 main.py 调用参数
-            cmd = [
-                sys.executable, "main.py",
-                "--input-dir", str(input_dir),
-                "--output-dir", str(output_dir),
-                "--overwrite-output",
-            ]
-            if template_path:
-                cmd += ["--template", str(template_path)]
-            if model_type:
-                cmd += ["--model-type", model_type]
-            if template_mode and template_mode != "auto":
-                cmd += ["--template-mode", template_mode]
-            if template_description:
-                cmd += ["--template-description", template_description]
-            if output_basename:
-                cmd += ["--output-basename", output_basename]
+            # 检查是否可以使用进程内执行器
+            if IN_PROCESS_EXECUTION_AVAILABLE and NEW_ARCHITECTURE_AVAILABLE:
+                log("使用进程内任务执行器")
 
-            # 新架构参数
-            if llm_mode and llm_mode != "full":  # full是默认值
-                cmd += ["--llm-mode", llm_mode]
-            if total_timeout and total_timeout != 110:  # 110是默认值
-                cmd += ["--total-timeout", str(total_timeout)]
-            if max_chunks and max_chunks != 50:  # 50是默认值
-                cmd += ["--max-chunks", str(max_chunks)]
-            if quiet:  # 布尔值，默认False
-                cmd += ["--quiet"]
+                # 构建任务配置
+                task_config = {
+                    "input_dir": str(input_dir),
+                    "output_dir": str(output_dir),
+                    "template_path": str(template_path) if template_path else None,
+                    "model_type": model_type,
+                    "template_mode": template_mode,
+                    "template_description": template_description,
+                    "llm_mode": llm_mode,
+                    "total_timeout": total_timeout,
+                    "max_chunks": max_chunks,
+                    "quiet": quiet,
+                    "output_basename": output_basename
+                }
 
-            log(f"执行命令: {' '.join(cmd)}")
+                # 使用进程内执行器
+                executor = get_task_executor()
+                # 创建日志回调函数
+                def log_callback(msg: str):
+                    log(msg)
 
-            proc = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                timeout=300,
-            )
+                # 执行任务
+                future = executor.execute_task(task_id, task_config, log_callback)
 
-            for line in proc.stdout.splitlines():
-                log(line)
-            for line in proc.stderr.splitlines():
-                log(f"[STDERR] {line}")
+                try:
+                    # 等待任务完成（阻塞当前线程，但这是后台线程，所以没问题）
+                    # 设置超时时间，给一些额外缓冲
+                    timeout_seconds = total_timeout + 120
+                    result = future.result(timeout=timeout_seconds)
+                    if result.get("status") == "success":
+                        self.update_status(task_id, "succeeded")
+                        log(f"任务成功完成，模式: {result.get('mode', 'unknown')}，耗时: {result.get('elapsed_time', 0):.1f}秒")
+                    else:
+                        self.update_status(task_id, "failed")
+                        log(f"任务失败: {result.get('error', '未知错误')}")
 
-            if proc.returncode == 0:
-                self.update_status(task_id, "succeeded")
-                log("任务成功完成")
+                except Exception as e:
+                    # 捕获所有异常，包括concurrent.futures.TimeoutError
+                    self.update_status(task_id, "failed")
+                    if "timeout" in str(e).lower() or isinstance(e, TimeoutError):
+                        log("任务超时")
+                    else:
+                        log(f"任务执行异常: {e}")
+                    # 尝试取消任务
+                    try:
+                        executor.cancel_task(task_id)
+                    except:
+                        pass
             else:
-                self.update_status(task_id, "failed")
-                log(f"任务失败，退出码: {proc.returncode}")
+                # 回退到子进程执行（保持向后兼容）
+                if not IN_PROCESS_EXECUTION_AVAILABLE:
+                    log("进程内执行器不可用，回退到子进程执行")
+                elif not NEW_ARCHITECTURE_AVAILABLE:
+                    log("新架构组件不可用，回退到子进程执行")
+                else:
+                    log("回退到子进程执行")
 
-        except subprocess.TimeoutExpired:
-            self.update_status(task_id, "failed")
-            log("任务超时（>300s）")
+                # 构建 main.py 调用参数
+                cmd = [
+                    sys.executable, "main.py",
+                    "--input-dir", str(input_dir),
+                    "--output-dir", str(output_dir),
+                    "--overwrite-output",
+                ]
+                if template_path:
+                    cmd += ["--template", str(template_path)]
+                if template_mode and template_mode != "auto":
+                    cmd += ["--template-mode", template_mode]
+                if template_description:
+                    cmd += ["--template-description", template_description]
+                if instruction:
+                    cmd += ["--instruction", instruction]
+                if output_basename:
+                    cmd += ["--output-basename", output_basename]
+
+                # 新架构参数
+                if llm_mode and llm_mode != "full":  # full是默认值
+                    cmd += ["--llm-mode", llm_mode]
+                if total_timeout and total_timeout != 110:  # 110是默认值
+                    cmd += ["--total-timeout", str(total_timeout)]
+                if max_chunks and max_chunks != 50:  # 50是默认值
+                    cmd += ["--max-chunks", str(max_chunks)]
+                if quiet:  # 布尔值，默认False
+                    cmd += ["--quiet"]
+
+                log(f"执行命令: {' '.join(cmd)}")
+
+                # 通过环境变量传递模型类型（main.py 不支持 --model-type 参数）
+                env = os.environ.copy()
+                if model_type:
+                    env["A23_MODEL_TYPE"] = str(model_type).strip()
+                # 子进程 stdout/stderr 行缓冲：尽快写入 extraction.log，便于网页端/排查
+                env.setdefault("PYTHONUNBUFFERED", "1")
+
+                # 用 Popen 流式写入日志，避免运行中“无输出”，也便于网页端实时显示
+                # 外层 watchdog：必须明显大于 main.py 的 --total-timeout（本地大文档+LLM 可能较慢）
+                to = float(total_timeout or 110)
+                timeout_seconds = to + 300.0
+
+                def _reader(pipe, prefix: str, q: Queue):
+                    try:
+                        for raw in iter(pipe.readline, ""):
+                            if raw is None:
+                                break
+                            line = raw.rstrip("\r\n")
+                            if line:
+                                q.put((prefix, line))
+                    except Exception:
+                        pass
+                    finally:
+                        try:
+                            pipe.close()
+                        except Exception:
+                            pass
+
+                proc = subprocess.Popen(
+                    cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    env=env,
+                )
+
+                q: Queue = Queue()
+                t_out = threading.Thread(target=_reader, args=(proc.stdout, "", q), daemon=True)
+                t_err = threading.Thread(target=_reader, args=(proc.stderr, "[STDERR] ", q), daemon=True)
+                t_out.start()
+                t_err.start()
+
+                start = time.time()
+                try:
+                    while True:
+                        # 持续刷新子进程输出到日志
+                        drained = 0
+                        while True:
+                            try:
+                                prefix, line = q.get_nowait()
+                                log(f"{prefix}{line}")
+                                drained += 1
+                            except Empty:
+                                break
+
+                        rc = proc.poll()
+                        if rc is not None:
+                            # 尾部再尽量 drain 一下
+                            for _ in range(2000):
+                                try:
+                                    prefix, line = q.get_nowait()
+                                    log(f"{prefix}{line}")
+                                except Empty:
+                                    break
+                            if rc == 0:
+                                self.update_status(task_id, "succeeded")
+                                log("任务成功完成")
+                            else:
+                                self.update_status(task_id, "failed")
+                                log(f"任务失败，退出码: {rc}")
+                            break
+
+                        if (time.time() - start) > timeout_seconds:
+                            try:
+                                proc.kill()
+                            except Exception:
+                                pass
+                            self.update_status(task_id, "failed")
+                            log(f"任务超时（>{int(timeout_seconds)}s），已终止子进程")
+                            break
+
+                        # 轻微 sleep，避免忙等
+                        if drained == 0:
+                            time.sleep(0.2)
+                finally:
+                    try:
+                        if proc.poll() is None:
+                            proc.kill()
+                    except Exception:
+                        pass
+
         except Exception as e:
             self.update_status(task_id, "failed")
             log(f"任务异常: {e}")

@@ -72,7 +72,17 @@ class ChunkMerger:
     """
 
     def __init__(self, config: Optional[MergeConfig] = None):
-        self.config = config or MergeConfig()
+        if config is None:
+            # 尝试从去重配置获取默认值
+            try:
+                from src.core.deduplication_config import get_similarity_threshold
+                threshold = get_similarity_threshold("chunk_merger")
+                config = MergeConfig(similarity_threshold=threshold)
+            except ImportError:
+                # 如果去重配置模块不可用，使用默认配置
+                config = MergeConfig()
+
+        self.config = config
         self._cache = {}  # 简单缓存，避免重复计算
 
     def merge_records(
@@ -476,8 +486,18 @@ class ChunkMerger:
 def smart_merge_records(
     records: List[Dict[str, Any]],
     key_fields: Optional[List[str]] = None,
-    similarity_threshold: float = 0.8
+    similarity_threshold: Optional[float] = None
 ) -> List[Dict[str, Any]]:
     """向后兼容的智能合并函数（可直接替换 merge_records_by_key）"""
     merger = ChunkMerger()
+
+    # 如果未提供阈值，使用配置的默认值
+    if similarity_threshold is None:
+        try:
+            from src.core.deduplication_config import get_similarity_threshold
+            similarity_threshold = get_similarity_threshold("chunk_merger")
+        except ImportError:
+            # 如果去重配置模块不可用，使用默认值0.8（保持向后兼容）
+            similarity_threshold = 0.8
+
     return merger.merge_records(records, key_fields, similarity_threshold)

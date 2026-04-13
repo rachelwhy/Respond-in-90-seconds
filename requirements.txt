@@ -5,7 +5,7 @@ openpyxl==3.1.0
 python-docx==1.1.0
 requests==2.31.0
 rapidfuzz==3.9.0
-openai==1.0.0
+openai==2.31.0  # 与 langextract[openai] 兼容，支持 OpenAI 兼容 API（DeepSeek/Qwen）
 python-multipart==0.0.9
 python-dotenv==1.0.0
 bcrypt==4.0.1
@@ -37,7 +37,7 @@ pdf2image==1.16.3
 
 # 新增依赖：Docling + LangExtract 重构
 docling>=2.0.0
-langextract>=0.1.0
+langextract[openai]>=0.1.0  # 包含 OpenAI 兼容 API 支持，用于 DeepSeek/OpenAI/Qwen
 diskcache>=5.6.3
 prometheus-client>=0.20.0
 

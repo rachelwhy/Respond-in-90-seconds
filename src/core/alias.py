@@ -9,6 +9,9 @@ try:
 except Exception:
     fuzz = None
 
+# 配置管理 - 简化版本（不使用ConfigManager，直接使用环境变量和config.py）
+_config = None  # 不再使用ConfigManager
+
 # 语义匹配：懒加载 sentence-transformers
 _semantic_model = None
 _semantic_ready = None  # None=未检查, True=可用, False=不可用
@@ -34,11 +37,80 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_ALIAS_PATH = "src/knowledge/field_aliases.json"
 
-# 默认模糊匹配阈值：优先读取环境变量，回退到 60
-_DEFAULT_FUZZY_THRESHOLD = int(os.environ.get("A23_FUZZY_THRESHOLD", "60"))
+
+def _get_config_int(key: str, default: int = 0) -> int:
+    """获取整数配置值，使用环境变量或config.py"""
+    try:
+        import src.config as config_module
+        # 检查config.py中是否有对应的常量
+        if hasattr(config_module, key):
+            value = getattr(config_module, key)
+            if isinstance(value, int):
+                return value
+    except ImportError:
+        pass
+
+    # 尝试环境变量
+    import os
+    # 先尝试带A23_前缀
+    env_key = f"A23_{key}"
+    value = os.environ.get(env_key)
+    if value is not None:
+        try:
+            return int(value)
+        except ValueError:
+            pass
+
+    # 尝试不带前缀
+    value = os.environ.get(key)
+    if value is not None:
+        try:
+            return int(value)
+        except ValueError:
+            pass
+
+    return default
+
+
+def _get_config_float(key: str, default: float = 0.0) -> float:
+    """获取浮点数配置值，使用环境变量或config.py"""
+    try:
+        import src.config as config_module
+        # 检查config.py中是否有对应的常量
+        if hasattr(config_module, key):
+            value = getattr(config_module, key)
+            if isinstance(value, (int, float)):
+                return float(value)
+    except ImportError:
+        pass
+
+    # 尝试环境变量
+    import os
+    # 先尝试带A23_前缀
+    env_key = f"A23_{key}"
+    value = os.environ.get(env_key)
+    if value is not None:
+        try:
+            return float(value)
+        except ValueError:
+            pass
+
+    # 尝试不带前缀
+    value = os.environ.get(key)
+    if value is not None:
+        try:
+            return float(value)
+        except ValueError:
+            pass
+
+    return default
+
+
+# 默认模糊匹配阈值：优先读取配置管理器，回退到环境变量，最后使用默认值
+_DEFAULT_FUZZY_THRESHOLD = _get_config_int("FUZZY_THRESHOLD", 60)
 
 # 语义匹配阈值（余弦相似度 0~1）
-_SEMANTIC_THRESHOLD = float(os.environ.get("A23_SEMANTIC_THRESHOLD", "0.55"))
+_SEMANTIC_THRESHOLD = _get_config_float("SEMANTIC_THRESHOLD", 0.55)
 
 
 @functools.lru_cache(maxsize=4)
@@ -53,8 +125,8 @@ def load_alias_map(alias_path: str = DEFAULT_ALIAS_PATH) -> dict:
             logger.debug(f"字段别名已加载，当前模糊匹配阈值: {_DEFAULT_FUZZY_THRESHOLD}")
             return kb.field_aliases
         except Exception as e:
-            print(f"[WARN] 通过知识源加载字段别名失败: {e}")
-            print(f"[INFO] 回退到直接文件加载")
+            logger.warning("通过知识源加载字段别名失败: %s", e)
+            logger.info("回退到直接文件加载")
 
     # 回退到直接文件加载（兼容自定义路径）
     if not os.path.exists(alias_path):

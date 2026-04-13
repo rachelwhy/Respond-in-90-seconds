@@ -12,6 +12,9 @@ import re
 from pathlib import Path
 from typing import Optional
 
+# 配置管理 - 简化版本（不使用ConfigManager）
+_config = None  # 不再使用ConfigManager，直接使用环境变量
+
 logger = logging.getLogger(__name__)
 
 _DEFAULT_RULES_PATH = Path(__file__).parent.parent / "knowledge" / "field_normalization_rules.json"
@@ -28,14 +31,51 @@ class FieldNormalizer:
     5. 格式化输出（若配置）
     """
 
-    _instance: Optional["FieldNormalizer"] = None
-    _rules: Optional[dict] = None
-    _annotation_re = None
+    # 默认实例（用于向后兼容，但不是严格的单例）
+    _default_instance: Optional["FieldNormalizer"] = None
+    _default_lock = None
 
     def __init__(self, config_path: Optional[str] = None):
-        path = config_path or os.environ.get("A23_NORMALIZATION_CONFIG") or str(_DEFAULT_RULES_PATH)
-        self._rules = self._load_rules(path)
+        """初始化字段规范化器
+
+        Args:
+            config_path: 规则配置文件路径，None时使用默认配置
+        """
+        if config_path is None:
+            # 从环境变量或config.py获取配置路径
+            import os
+            # 首先尝试环境变量
+            env_path = os.environ.get("A23_NORMALIZATION_CONFIG")
+            if env_path:
+                config_path = env_path
+            else:
+                # 尝试从config.py获取
+                try:
+                    import src.config as config_module
+                    config_path = config_module.NORMALIZATION_CONFIG
+                except (ImportError, AttributeError):
+                    # 使用默认路径
+                    config_path = str(_DEFAULT_RULES_PATH)
+
+        self._config_path = config_path
+        self._rules: Optional[dict] = None
+        self._annotation_re = None
+        self._load_config()
+
+    def _load_config(self):
+        """加载配置规则"""
+        self._rules = self._load_rules(self._config_path)
         self._annotation_re = self._build_annotation_re()
+
+    def reload(self, config_path: Optional[str] = None):
+        """重新加载配置
+
+        Args:
+            config_path: 新的配置文件路径，None时使用当前路径
+        """
+        if config_path is not None:
+            self._config_path = config_path
+        self._load_config()
 
     def _build_annotation_re(self):
         """从已加载的规则中构建标注关键字正则（动态、可配置）"""
@@ -46,11 +86,20 @@ class FieldNormalizer:
         return None
 
     @classmethod
-    def get_instance(cls) -> "FieldNormalizer":
-        """单例访问（复用加载开销）"""
-        if cls._instance is None:
-            cls._instance = cls()
-        return cls._instance
+    def get_default(cls) -> "FieldNormalizer":
+        """获取默认实例（用于向后兼容）
+
+        注意：这不是严格的单例，每次调用可能返回新实例。
+        推荐在长期运行的应用中创建并复用FieldNormalizer实例。
+        """
+        if cls._default_instance is None:
+            cls._default_instance = cls()
+        return cls._default_instance
+
+    @classmethod
+    def reset_default(cls, config_path: Optional[str] = None):
+        """重置默认实例（主要用于测试）"""
+        cls._default_instance = None if config_path is None else cls(config_path)
 
     def _load_rules(self, path: str) -> dict:
         try:
