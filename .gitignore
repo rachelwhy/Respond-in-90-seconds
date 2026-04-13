@@ -62,8 +62,26 @@ harness/*
 uv_err.txt
 .backup/
 
+# 单元测试、集成测试与批处理脚本（仅本地保留，不上传仓库）
+tests/
+scripts/
+
+# 本地基准 / 一次性跑分输出
+.benchmarks/
+
+# 运行期生成的向量库 / 缓存 / 记忆类目录（RAG、Chroma 等）
+chroma/
+*.db
+*.sqlite3
+memory/
+.rag_cache/
+
 # Test data (optional, include if you want to ignore test inputs)
 命令行端测试/
+
+# 若存在此类目录：样例输出、全量跑数结果
+sample_outputs*/
+sample_outputs_full/
 
 # Temporary files
 *.tmp

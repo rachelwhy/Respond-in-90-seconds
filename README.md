@@ -30,8 +30,8 @@ Respond in 90 seconds_A23/
 │   ├── knowledge/          # 别名与归一化等知识资源
 │   └── config.py
 ├── third_party/            # 可选：内嵌第三方库（如 langextract）
-├── tests/                  # 单元 / 集成测试
-├── scripts/                # 工具脚本
+├── tests/                  # （本地）单元 / 集成测试 — 默认不入库，见 .gitignore
+├── scripts/                # （本地）批处理 / 工具脚本 — 默认不入库
 ├── profiles/               # 模板 profile 示例
 ├── storage/                # API 任务与上传持久化（可按环境忽略）
 ├── requirements.txt

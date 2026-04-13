@@ -285,7 +285,7 @@ A23_ENABLE_OCR=false
 
 ## 开发工作流
 1. **配置环境**: 设置 `.env` 文件，包含正确的模型API密钥
-2. **运行测试**: 确保现有功能正常 `python -m pytest tests/ -v`
+2. **运行测试**（`tests/` 为本地目录，默认不提交到 Git）: `python -m pytest tests/ -v`
 3. **增量开发**: 修改特定模块，保持接口稳定
 4. **验证结果**: 使用 `scripts/run_batch.py --validate` 验证准确率，并测试新架构功能：
    - 测试字段归一化: `python -c "from src.core.field_normalizer import FieldNormalizer; fn = FieldNormalizer(); print(fn.normalize('增长率', '15.3%'))"`
