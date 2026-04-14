@@ -1,4 +1,4 @@
-# Respond in 90 seconds_A23
+# Doc90
 
 A23赛题算法后端：基于RAG的异构文档理解与信息抽取系统
 
@@ -260,7 +260,7 @@ A: 检查API密钥是否正确，网络是否可访问DeepSeek API。
 ### Q5: OCR功能无法使用
 A: 确认已安装Tesseract和Poppler，并添加到系统PATH。
 
-## 架构升级说明（v2.0）
+## 架构升级说明（v3.0）
 
 系统已完成从"低层次文本切片 + 硬编码后处理"到"深度Docling语义结构 + 可配置通用后处理 + 工程鲁棒性"的架构升级，主要改进包括：
 
@@ -282,4 +282,4 @@ A: 确认已安装Tesseract和Poppler，并添加到系统PATH。
 
 ## 许可证
 
-MIT License © 2026 Respond in 90 seconds_A23 团队
+MIT License © 2026 Doc90 团队
