@@ -37,6 +37,71 @@ except ImportError as e:
 STORAGE_ROOT = Path("storage/tasks")
 
 
+def _collect_output_files(output_dir: Path) -> Dict[str, Any]:
+    """扫描输出目录并返回兼容单文件/多文件的结果映射。"""
+    result: Dict[str, Any] = {}
+    if not output_dir.exists():
+        return result
+
+    excel_files: List[str] = []
+    json_files: List[str] = []
+    report_files: List[str] = []
+    by_input: Dict[str, Dict[str, str]] = {}
+
+    def _ensure_group(name: str) -> Dict[str, str]:
+        grp = by_input.get(name)
+        if grp is None:
+            grp = {}
+            by_input[name] = grp
+        return grp
+
+    for f in sorted(output_dir.iterdir(), key=lambda p: p.name.lower()):
+        if not f.is_file():
+            continue
+        name = f.name.lower()
+        path = str(f)
+
+        if f.suffix == ".xlsx":
+            excel_files.append(path)
+            if name.endswith("_result.xlsx"):
+                base = f.name[:-len("_result.xlsx")]
+                _ensure_group(base)["excel"] = path
+            continue
+
+        if f.suffix == ".json":
+            if "report_bundle" in name or name.endswith("_result_report.json"):
+                report_files.append(path)
+                if name.endswith("_result_report.json"):
+                    base = f.name[:-len("_result_report.json")]
+                    _ensure_group(base)["report_bundle"] = path
+            elif name.endswith("_result.json"):
+                json_files.append(path)
+                base = f.name[:-len("_result.json")]
+                _ensure_group(base)["json"] = path
+            else:
+                json_files.append(path)
+
+    # 保持单文件字段兼容性；当存在多文件时，按排序结果选择首个文件作为默认值。
+    if excel_files:
+        result["excel"] = excel_files[0]
+        result["result_xlsx"] = excel_files[0]
+        if len(excel_files) > 1:
+            result["excel_files"] = excel_files
+    if json_files:
+        result["json"] = json_files[0]
+        result["result_json"] = json_files[0]
+        if len(json_files) > 1:
+            result["json_files"] = json_files
+    if report_files:
+        result["report_bundle"] = report_files[0]
+        if len(report_files) > 1:
+            result["report_bundle_files"] = report_files
+    if by_input:
+        result["by_input"] = by_input
+        result["multi_input"] = len(by_input) > 1
+    return result
+
+
 @dataclass
 class TaskInfo:
     task_id: str
@@ -105,29 +170,11 @@ class TaskManager:
                 self._tasks.values(), key=lambda x: x.created_at, reverse=True
             )]
 
-    def get_output_files(self, task_id: str) -> Dict[str, str]:
+    def get_output_files(self, task_id: str) -> Dict[str, Any]:
         info = self._tasks.get(task_id)
         if not info:
             return {}
-        output_dir = info.task_dir / "output"
-        result = {}
-        for f in output_dir.iterdir():
-            name = f.name.lower()
-            if f.suffix == ".xlsx":
-                # 兼容多命名：excel / result_xlsx
-                result["excel"] = str(f)
-                result["result_xlsx"] = str(f)
-            elif f.suffix == ".json":
-                # 兼容 main.py 的输出命名：*_result.json / *_result_report.json
-                if "report_bundle" in name or name.endswith("_result_report.json"):
-                    result["report_bundle"] = str(f)
-                elif name.endswith("_result.json"):
-                    result["json"] = str(f)
-                    result["result_json"] = str(f)
-                else:
-                    # 兜底：不要覆盖已识别的 result_json/report_bundle
-                    result.setdefault("json", str(f))
-        return result
+        return _collect_output_files(info.task_dir / "output")
 
     def read_log(self, task_id: str, limit: int = 200) -> List[str]:
         info = self._tasks.get(task_id)
@@ -157,7 +204,7 @@ class TaskManager:
     def _start_cleanup_thread(self):
         """后台清理线程：删除超过保留时长的任务目录。
 
-        目标：生产环境“省心”，避免 storage/tasks 无限增长。
+        目标：在保留期内自动回收过期任务目录，控制 storage/tasks 增长。
         """
         def _loop():
             while True:
@@ -222,9 +269,113 @@ class TaskManager:
                 from pathlib import Path
                 first_file = saved_inputs[0]
                 output_basename = Path(first_file).stem
+            multi_input_mode = len(saved_inputs) > 1
+
+            def _build_main_cmd(input_target: Path, out_basename: str) -> List[str]:
+                cmd = [
+                    sys.executable, "main.py",
+                    "--input-dir", str(input_target),
+                    "--output-dir", str(output_dir),
+                    "--overwrite-output",
+                ]
+                if template_path:
+                    cmd += ["--template", str(template_path)]
+                if template_mode and template_mode != "auto":
+                    cmd += ["--template-mode", template_mode]
+                if template_description:
+                    cmd += ["--template-description", template_description]
+                if instruction:
+                    cmd += ["--instruction", instruction]
+                if out_basename:
+                    cmd += ["--output-basename", out_basename]
+
+                if llm_mode and llm_mode != "full":
+                    cmd += ["--llm-mode", llm_mode]
+                if total_timeout and total_timeout != 110:
+                    cmd += ["--total-timeout", str(total_timeout)]
+                if max_chunks and max_chunks != 50:
+                    cmd += ["--max-chunks", str(max_chunks)]
+                if quiet:
+                    cmd += ["--quiet"]
+                return cmd
+
+            def _run_subprocess_and_stream(cmd: List[str], env: Dict[str, str], timeout_seconds: float) -> tuple[int, bool]:
+                log(f"执行命令: {' '.join(cmd)}")
+                proc = subprocess.Popen(
+                    cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    env=env,
+                )
+
+                q: Queue = Queue()
+
+                def _reader(pipe, prefix: str, q: Queue):
+                    try:
+                        for raw in iter(pipe.readline, ""):
+                            if raw is None:
+                                break
+                            line = raw.rstrip("\r\n")
+                            if line:
+                                q.put((prefix, line))
+                    except Exception:
+                        pass
+                    finally:
+                        try:
+                            pipe.close()
+                        except Exception:
+                            pass
+
+                t_out = threading.Thread(target=_reader, args=(proc.stdout, "", q), daemon=True)
+                t_err = threading.Thread(target=_reader, args=(proc.stderr, "[STDERR] ", q), daemon=True)
+                t_out.start()
+                t_err.start()
+
+                start = time.time()
+                timed_out = False
+                try:
+                    while True:
+                        drained = 0
+                        while True:
+                            try:
+                                prefix, line = q.get_nowait()
+                                log(f"{prefix}{line}")
+                                drained += 1
+                            except Empty:
+                                break
+
+                        rc = proc.poll()
+                        if rc is not None:
+                            for _ in range(2000):
+                                try:
+                                    prefix, line = q.get_nowait()
+                                    log(f"{prefix}{line}")
+                                except Empty:
+                                    break
+                            return rc, timed_out
+
+                        if (time.time() - start) > timeout_seconds:
+                            timed_out = True
+                            try:
+                                proc.kill()
+                            except Exception:
+                                pass
+                            return -9, timed_out
+
+                        if drained == 0:
+                            time.sleep(0.2)
+                finally:
+                    try:
+                        if proc.poll() is None:
+                            proc.kill()
+                    except Exception:
+                        pass
 
             # 检查是否可以使用进程内执行器
-            if IN_PROCESS_EXECUTION_AVAILABLE and NEW_ARCHITECTURE_AVAILABLE:
+            if IN_PROCESS_EXECUTION_AVAILABLE and NEW_ARCHITECTURE_AVAILABLE and not multi_input_mode:
                 log("使用进程内任务执行器")
 
                 # 构建任务配置
@@ -276,43 +427,15 @@ class TaskManager:
                     except:
                         pass
             else:
-                # 回退到子进程执行（保持向后兼容）
-                if not IN_PROCESS_EXECUTION_AVAILABLE:
+                # 当进程内执行不可用时，回退到子进程执行路径。
+                if multi_input_mode:
+                    log("检测到多输入文件：启用同模板逐文件顺序执行（每个文件独立抽取与输出）")
+                elif not IN_PROCESS_EXECUTION_AVAILABLE:
                     log("进程内执行器不可用，回退到子进程执行")
                 elif not NEW_ARCHITECTURE_AVAILABLE:
                     log("新架构组件不可用，回退到子进程执行")
                 else:
                     log("回退到子进程执行")
-
-                # 构建 main.py 调用参数
-                cmd = [
-                    sys.executable, "main.py",
-                    "--input-dir", str(input_dir),
-                    "--output-dir", str(output_dir),
-                    "--overwrite-output",
-                ]
-                if template_path:
-                    cmd += ["--template", str(template_path)]
-                if template_mode and template_mode != "auto":
-                    cmd += ["--template-mode", template_mode]
-                if template_description:
-                    cmd += ["--template-description", template_description]
-                if instruction:
-                    cmd += ["--instruction", instruction]
-                if output_basename:
-                    cmd += ["--output-basename", output_basename]
-
-                # 新架构参数
-                if llm_mode and llm_mode != "full":  # full是默认值
-                    cmd += ["--llm-mode", llm_mode]
-                if total_timeout and total_timeout != 110:  # 110是默认值
-                    cmd += ["--total-timeout", str(total_timeout)]
-                if max_chunks and max_chunks != 50:  # 50是默认值
-                    cmd += ["--max-chunks", str(max_chunks)]
-                if quiet:  # 布尔值，默认False
-                    cmd += ["--quiet"]
-
-                log(f"执行命令: {' '.join(cmd)}")
 
                 # 通过环境变量传递模型类型（main.py 不支持 --model-type 参数）
                 env = os.environ.copy()
@@ -321,91 +444,41 @@ class TaskManager:
                 # 子进程 stdout/stderr 行缓冲：尽快写入 extraction.log，便于网页端/排查
                 env.setdefault("PYTHONUNBUFFERED", "1")
 
-                # 用 Popen 流式写入日志，避免运行中“无输出”，也便于网页端实时显示
                 # 外层 watchdog：必须明显大于 main.py 的 --total-timeout（本地大文档+LLM 可能较慢）
                 to = float(total_timeout or 110)
                 timeout_seconds = to + 300.0
-
-                def _reader(pipe, prefix: str, q: Queue):
-                    try:
-                        for raw in iter(pipe.readline, ""):
-                            if raw is None:
-                                break
-                            line = raw.rstrip("\r\n")
-                            if line:
-                                q.put((prefix, line))
-                    except Exception:
-                        pass
-                    finally:
-                        try:
-                            pipe.close()
-                        except Exception:
-                            pass
-
-                proc = subprocess.Popen(
-                    cmd,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    text=True,
-                    encoding="utf-8",
-                    errors="replace",
-                    env=env,
-                )
-
-                q: Queue = Queue()
-                t_out = threading.Thread(target=_reader, args=(proc.stdout, "", q), daemon=True)
-                t_err = threading.Thread(target=_reader, args=(proc.stderr, "[STDERR] ", q), daemon=True)
-                t_out.start()
-                t_err.start()
-
-                start = time.time()
-                try:
-                    while True:
-                        # 持续刷新子进程输出到日志
-                        drained = 0
-                        while True:
-                            try:
-                                prefix, line = q.get_nowait()
-                                log(f"{prefix}{line}")
-                                drained += 1
-                            except Empty:
-                                break
-
-                        rc = proc.poll()
-                        if rc is not None:
-                            # 尾部再尽量 drain 一下
-                            for _ in range(2000):
-                                try:
-                                    prefix, line = q.get_nowait()
-                                    log(f"{prefix}{line}")
-                                except Empty:
-                                    break
-                            if rc == 0:
-                                self.update_status(task_id, "succeeded")
-                                log("任务成功完成")
-                            else:
-                                self.update_status(task_id, "failed")
-                                log(f"任务失败，退出码: {rc}")
-                            break
-
-                        if (time.time() - start) > timeout_seconds:
-                            try:
-                                proc.kill()
-                            except Exception:
-                                pass
+                if multi_input_mode:
+                    for idx, fname in enumerate(saved_inputs, start=1):
+                        input_target = input_dir / fname
+                        if not input_target.exists():
                             self.update_status(task_id, "failed")
+                            log(f"任务失败：输入文件不存在 {input_target}")
+                            return
+                        out_basename = Path(fname).stem
+                        log(f"[{idx}/{len(saved_inputs)}] 开始处理：{fname}")
+                        cmd = _build_main_cmd(input_target, out_basename)
+                        rc, timed_out = _run_subprocess_and_stream(cmd, env, timeout_seconds)
+                        if rc != 0:
+                            self.update_status(task_id, "failed")
+                            if timed_out:
+                                log(f"[{idx}/{len(saved_inputs)}] 处理超时（>{int(timeout_seconds)}s），已终止")
+                            else:
+                                log(f"[{idx}/{len(saved_inputs)}] 处理失败，退出码: {rc}")
+                            return
+                    self.update_status(task_id, "succeeded")
+                    log("任务成功完成（多输入逐文件执行）")
+                else:
+                    cmd = _build_main_cmd(input_dir, output_basename)
+                    rc, timed_out = _run_subprocess_and_stream(cmd, env, timeout_seconds)
+                    if rc == 0:
+                        self.update_status(task_id, "succeeded")
+                        log("任务成功完成")
+                    else:
+                        self.update_status(task_id, "failed")
+                        if timed_out:
                             log(f"任务超时（>{int(timeout_seconds)}s），已终止子进程")
-                            break
-
-                        # 轻微 sleep，避免忙等
-                        if drained == 0:
-                            time.sleep(0.2)
-                finally:
-                    try:
-                        if proc.poll() is None:
-                            proc.kill()
-                    except Exception:
-                        pass
+                        else:
+                            log(f"任务失败，退出码: {rc}")
 
         except Exception as e:
             self.update_status(task_id, "failed")

@@ -15,10 +15,13 @@
 """Progress and visualization utilities for LangExtract."""
 from __future__ import annotations
 
+import logging
 from typing import Any
 import urllib.parse
 
 import tqdm
+
+logger = logging.getLogger(__name__)
 
 # ANSI color codes for terminal output
 BLUE = "\033[94m"
@@ -112,16 +115,17 @@ def print_download_complete(
     word_count: Number of words downloaded.
     filename: Name of the downloaded file.
   """
-  print(
-      f"{GREEN}✓{RESET} Downloaded {BOLD}{char_count:,}{RESET} characters "
-      f"({BOLD}{word_count:,}{RESET} words) from {BLUE}{filename}{RESET}",
-      flush=True,
+  logger.info(
+      "Downloaded %s characters (%s words) from %s",
+      f"{char_count:,}",
+      f"{word_count:,}",
+      filename,
   )
 
 
 def print_extraction_complete() -> None:
   """Print a generic extraction completion message."""
-  print(f"{GREEN}✓{RESET} Extraction processing complete", flush=True)
+  logger.info("Extraction processing complete")
 
 
 def print_extraction_summary(
@@ -140,10 +144,10 @@ def print_extraction_summary(
     chars_processed: Optional number of characters processed.
     num_chunks: Optional number of chunks processed.
   """
-  print(
-      f"{GREEN}✓{RESET} Extracted {BOLD}{num_extractions}{RESET} entities "
-      f"({BOLD}{unique_classes}{RESET} unique types)",
-      flush=True,
+  logger.info(
+      "Extracted %s entities (%s unique types)",
+      num_extractions,
+      unique_classes,
   )
 
   if elapsed_time is not None:
@@ -161,7 +165,7 @@ def print_extraction_summary(
       metrics.append(f"Chunks: {BOLD}{num_chunks}{RESET}")
 
     for metric in metrics:
-      print(f"  {CYAN}•{RESET} {metric}", flush=True)
+      logger.info("metric: %s", metric)
 
 
 def create_save_progress_bar(
@@ -228,11 +232,7 @@ def print_save_complete(num_docs: int, file_path: str) -> None:
     file_path: Path to the saved file.
   """
   filename = file_path.split("/")[-1]
-  print(
-      f"{GREEN}✓{RESET} Saved {BOLD}{num_docs}{RESET} documents to"
-      f" {GREEN}{filename}{RESET}",
-      flush=True,
-  )
+  logger.info("Saved %s documents to %s", num_docs, filename)
 
 
 def print_load_complete(num_docs: int, file_path: str) -> None:
@@ -243,11 +243,7 @@ def print_load_complete(num_docs: int, file_path: str) -> None:
     file_path: Path to the loaded file.
   """
   filename = file_path.split("/")[-1]
-  print(
-      f"{GREEN}✓{RESET} Loaded {BOLD}{num_docs}{RESET} documents from"
-      f" {GREEN}{filename}{RESET}",
-      flush=True,
-  )
+  logger.info("Loaded %s documents from %s", num_docs, filename)
 
 
 def get_model_info(language_model: Any) -> str | None:

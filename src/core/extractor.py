@@ -18,6 +18,7 @@ from typing import Dict, List, Any, Optional
 
 from src.adapters.model_client import call_model
 from src.adapters.parser_factory import get_parser
+from src.core.llm_mode import normalize_llm_mode
 
 logger = logging.getLogger(__name__)
 
@@ -120,36 +121,23 @@ class UniversalExtractor:
         result.records.extend(table_records)
 
         # ── LLM 文本抽取模式控制 ──────────────────────────────────────────
-        llm_mode = self.config.get("llm_mode", "full")
+        llm_mode = normalize_llm_mode(self.config.get("llm_mode", "full"))
         field_names = [f["name"] if isinstance(f, dict) else f for f in template_fields]
         doc_text = parse_result.get("text", "")
 
         if llm_mode == "off" or not doc_text:
             llm_records = []
-        elif llm_mode == "full":
-            # 始终调用 LLM 全文抽取，再与表格结果融合
-            llm_records = self._extract_from_text(doc_text, field_names, profile)
         else:
-            # "supplement"：仅在字段不完整时调用 LLM
-            missing = self._find_missing_fields(result.records, field_names)
-            llm_records = self._extract_from_text(doc_text, field_names, profile) if missing else []
+            # full：调用 LLM 再与表格结果融合（supplement 已映射到 full）
+            llm_records = self._extract_from_text(doc_text, field_names, profile)
 
         # ── 融合 table_records + llm_records ──────────────────────────────
         if llm_records:
             if result.records:
-                if llm_mode == "full":
-                    # 全量融合：合并后去重，优先保留表格数据中的非空值
-                    combined = list(result.records) + llm_records
-                    key_fields = profile.get("dedup_key_fields") if profile else None
-                    result.records = self._merge_by_key(combined, key_fields)
-                else:
-                    # supplement 模式：只补充缺失字段
-                    missing = self._find_missing_fields(result.records, field_names)
-                    for rec in result.records:
-                        for lr in llm_records:
-                            for f in missing:
-                                if not rec.get(f) and lr.get(f):
-                                    rec[f] = lr[f]
+                # 全量融合：合并后去重，优先保留表格数据中的非空值
+                combined = list(result.records) + llm_records
+                key_fields = profile.get("dedup_key_fields") if profile else None
+                result.records = self._merge_by_key(combined, key_fields)
             else:
                 result.records = llm_records
 

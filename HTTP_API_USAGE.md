@@ -1,174 +1,127 @@
-# A23 HTTP API 使用说明（企业内网版）
+# A23 HTTP API 对接说明（后端交付版）
 
 ## 启动
 ```bash
 uvicorn api_server:app --host 0.0.0.0 --port 8000
 ```
 
-Swagger 文档：
-- http://127.0.0.1:8000/docs
+- Swagger: [http://127.0.0.1:8000/docs](http://127.0.0.1:8000/docs)
+- 所有接口默认无鉴权（由上游网关或后端统一管控）
 
-## 环境与异步任务（当前行为）
+## 环境变量（对接相关）
 
-以下由 `src/config.py` 读取环境变量（`A23_*`），**不改变接口路径**，仅影响是否落盘与清理：
-
-| 变量 | 含义 |
+| 变量 | 作用 |
 |------|------|
-| `A23_ENABLE_TASKS` | 为 `false` 时，`/api/tasks/*` 返回 404 |
-| `A23_PERSIST_UPLOADS` | 是否持久化上传文件 |
-| `A23_PERSIST_PROFILES` | 是否自动写入生成的 profile |
-| `A23_TASK_RETENTION_HOURS` / `A23_UPLOAD_RETENTION_HOURS` / `A23_TEMP_RETENTION_HOURS` | 本地目录保留时长（小时） |
+| `A23_ENABLE_TASKS` | 是否启用 `/api/tasks/*` |
+| `A23_PERSIST_UPLOADS` | 是否持久化上传与临时导出 |
+| `A23_PERSIST_PROFILES` | 是否持久化自动生成 profile |
+| `A23_TASK_RETENTION_HOURS` | 任务目录保留时长（`storage/tasks`） |
+| `A23_UPLOAD_RETENTION_HOURS` | 上传目录保留时长（`storage/uploads/<task_id>`） |
+| `A23_TEMP_RETENTION_HOURS` | 临时导出文件保留时长（`storage/uploads/temp`） |
+| `A23_DEBUG` | 调试模式；影响 report 调试信息暴露 |
 
-**异步任务 `POST /api/tasks/create`**：后台线程通过子进程执行 `main.py`，并向子进程传入 `A23_MODEL_TYPE` 等环境变量；子进程通常设置 **`PYTHONUNBUFFERED=1`**，便于 `extraction.log` 实时刷新。  
-外层 watchdog 超时约为 **`total_timeout`（表单参数，默认 110）+ 300 秒** 缓冲，用于防止子进程无限挂死；**主流程内部超时**仍由 `main.py --total-timeout` 控制。
+## 路由总览
 
-## 认证系统（已移除）
+### 健康与模型
+- `GET /api/health`
+- `GET /api/models`
+- `POST /api/models/test-connection`
+- `POST /api/models/switch`
 
-> **注意**: 根据后端要求，AI端不处理鉴权，所有接口均为公开接口。以下认证系统文档仅供参考（历史版本）。
+### 抽取接口
+- `POST /api/extract/direct`
+- `POST /api/extract/no-template`
+- `POST /api/extract/pre-analyze`
 
-> **建议**：若不需要保留历史说明，可删除本段 JWT 示例，仅保留本段首句，避免与「公开接口」矛盾。
+### 异步任务
+- `POST /api/tasks/create`
+- `GET /api/tasks/{task_id}`
+- `GET /api/tasks/{task_id}/events`
+- `GET /api/tasks/{task_id}/log`
+- `GET /api/tasks/{task_id}/stream`
+- `GET /api/tasks/{task_id}/result`
+- `GET /api/tasks/{task_id}/download/{kind}`
+- `POST /api/tasks/{task_id}/export-complete`
+- `DELETE /api/tasks/{task_id}`
 
-系统使用JWT令牌进行认证，所有API端点（除健康检查和登录外）都需要有效的Bearer Token。
+### 临时导出下载
+- `GET /api/download/temp/{filename}`
+- `POST /api/download/temp/{filename}/export-complete`
 
-### 1. 登录获取Token
-- **端点**: POST `/api/auth/login`
-- **请求体**:
-  ```json
-  {
-    "username": "admin",
-    "password": "admin123"
-  }
-  ```
-- **响应**:
-  ```json
-  {
-    "access_token": "eyJhbGciOiJIUzI1NiIs...",
-    "token_type": "bearer",
-    "expires_in": 1800
-  }
-  ```
+### 其他能力
+- `POST /api/qna/ask`
+- `POST /api/document/operate`
+- `POST /api/ingest`
+- `POST /api/tasks/{task_id}/ingest`
+- `GET /api/ingest/{task_id}/records`
+- `GET /api/db/health`
 
-### 2. 使用Token
-在请求头中添加：
-```
-Authorization: Bearer <access_token>
-```
+## 1) 模板任务（推荐后端集成方式）
 
-### 3. 用户管理
-- **获取当前用户信息**: GET `/api/auth/me` (需要认证)
-- **获取所有用户**: GET `/api/auth/users` (仅管理员)
-- **注册新用户**: POST `/api/auth/register` (仅管理员)
+### 创建任务
+- **端点**: `POST /api/tasks/create`
+- **请求**: `multipart/form-data`
+- **主要参数**:
+  - `template`（可选，自动/文件模板模式时使用）
+  - `input_files`（可多文件）
+  - `note`（业务抽取指令）
+  - `model_type`（`ollama/openai/qwen/deepseek`）
+  - `template_mode`（`auto/file/llm`）
+  - `template_description`（`template_mode=llm` 时使用）
+  - `llm_mode`（`full/off`，`supplement` 自动映射到 `full`）
+  - `total_timeout`、`max_chunks`、`quiet`
 
-### 4. 默认账户
-首次启动时系统会自动创建默认管理员账户：
-- 用户名: `admin`
-- 密码: `admin123`
+### 查询与下载
+- `GET /api/tasks/{task_id}`：任务状态与输出文件索引
+- `GET /api/tasks/{task_id}/result`：任务结果摘要
+- `GET /api/tasks/{task_id}/download/{kind}`：下载文件
 
-## 核心接口
+### 导出后清理（新增）
+- **任务级确认**：`POST /api/tasks/{task_id}/export-complete?cleanup=true|false`
+  - `cleanup=true`：立即删除任务目录（默认）
+  - `cleanup=false`：仅记录确认，不删除
 
-> **认证要求**: 根据后端要求，AI端不处理鉴权，所有接口均为公开接口。
+## 2) 抽取结果输出约定（后端必须知道）
 
-### 1. 健康检查
-- GET `/api/health`
+### `output_files` 对外约定
+- 对后端返回的 `output_files` **默认不包含** `report_bundle`（调试产物）
+- 常用字段：
+  - `result_json` / `json`
+  - `result_xlsx` / `excel`
+  - `by_input`（多文件时按输入文件分组）
+  - `multi_input`
 
-### 2. 模板填表任务
+### `report_bundle` 规则
+- 默认不在 API 响应中暴露
+- `download/report_bundle` 在非调试模式返回 404
+- 调试时如需读取 report，请在内网运维侧开启 `A23_DEBUG`
 
-#### 创建任务
-- **端点**: POST `/api/tasks/create`
-- **认证**: 无需认证（根据后端要求，AI端不处理鉴权）
-- **请求格式**: multipart/form-data
-- **参数**:
-  - `template`: 模板文件（Excel/Word）（可选，template_mode为'file'或'auto'时需要）
-  - `input_files`: 输入文件列表（支持多个文件）
-  - `note`: 可选，自定义抽取指令
-  - `model_type`: 可选，模型类型（`ollama`、`openai`、`qwen`、`deepseek`），默认使用环境变量 `A23_MODEL_TYPE` 配置
-  - `template_mode`: 可选，模板模式，可选值：'file'（使用上传的模板文件）、'llm'（仅用LLM指令生成模板）、'auto'（自动选择，默认）
-  - `template_description`: 可选，模板描述（当template_mode='llm'时必填）
-  - `llm_mode`: 可选，LLM抽取模式，可选值：'full'（始终全文抽取，默认）、'supplement'（仅补充缺失字段）、'off'（仅规则抽取）
-  - `total_timeout`: 可选，总超时时间（秒），默认110秒
-  - `max_chunks`: 可选，最大语义分块数量，默认50
-  - `quiet`: 可选，安静模式，禁用控制台输出，默认False
-- **响应**:
-  ```json
-  {
-    "task_id": "任务ID",
-    "status": "queued",
-    "template_name": "模板文件名",
-    "input_files": ["文件1", "文件2"],
-    "status_url": "/api/tasks/{task_id}",
-    "events_url": "/api/tasks/{task_id}/events",
-    "stream_url": "/api/tasks/{task_id}/stream",
-    "result_url": "/api/tasks/{task_id}/result"
-  }
-  ```
+## 3) 直接抽取：`/api/extract/direct`
 
-#### 其他端点
-- GET `/api/tasks/{task_id}` - 获取任务状态
-- GET `/api/tasks/{task_id}/events` - 获取任务日志
-- GET `/api/tasks/{task_id}/stream` - SSE 实时日志流
-- GET `/api/tasks/{task_id}/result` - 获取任务结果摘要
-- GET `/api/tasks/{task_id}/download/{kind}` - 下载输出文件（`result_json`、`result_xlsx`、`result_docx`、`report_bundle`）
+- **用途**：同步抽取，适合小规模请求
+- **返回**：始终 JSON；包含 `metadata` 与 `routing_info`
+- `routing_info.complexity_analysis` 提供分流估算信息
 
-### 3. 直接抽取API
+## 4) 无模板抽取：`/api/extract/no-template`
 
-#### 直接抽取
-- **端点**: POST `/api/extract/direct`
-- **认证**: 无需认证
-- **请求格式**: multipart/form-data
-- **参数**:
-  - `template`: 模板文件（Excel/Word）
-  - `input_files`: 输入文件列表（支持多个文件）
-  - `model_type`: 可选，模型类型（`ollama`、`openai`、`qwen`、`deepseek`），默认使用环境变量 `A23_MODEL_TYPE` 配置
-  - `instruction`: 可选，自定义抽取指令
-  - `llm_mode`: 可选，LLM抽取模式，可选值：'full'（始终全文抽取，默认）、'supplement'（仅补充缺失字段）、'off'（仅规则抽取）（默认 'full'）
-  - `enable_unit_aware`: 可选，启用单位感知提取（默认 `true`）
-  - `total_timeout`: 可选，总超时时间（秒），默认110秒
-  - `max_chunks`: 可选，最大语义分块数量，默认50
-  - `quiet`: 可选，安静模式，禁用控制台输出，默认False
-- **响应**:
-  ```json
-  {
-    "success": true,
-    "data": { ... },  // 抽取结果，格式与任务结果相同
-    "metadata": {
-      "template_path": "...",
-      "input_dir": "...",
-      "model_type": "...",
-      "instruction": "...",
-      "internal_route_used": "...",
-      "missing_required_fields": [...],
-      "rule_extraction_summary": { ... },
-      "unit_aware_extraction": true/false
-    },
-    "unit_aware_result": { ... }  // 可选，单位感知提取结果
-  }
-  ```
-- **特点**: 直接调用抽取核心，无需创建任务，实时返回结果。适用于快速测试和小规模抽取。
+- `instruction` **可选**；为空时走自动结构分析模式
+- 接口始终返回 JSON
+- 当生成了结构化输出文件（如 xlsx）时：
+  - 返回 `download_url`（用于后端下载）
+  - 返回 `output_file`（服务端持久化路径）
+  - `metadata.persisted_output=true`
 
-### 4. 无模板抽取API
+### 临时导出确认清理（新增）
+- `POST /api/download/temp/{filename}/export-complete`
+  - 后端确认文件已接收后调用
+  - 触发立即删除临时文件
 
-#### 无模板抽取
-- **端点**: POST `/api/extract/no-template`
-- **认证**: 无需认证
-- **请求格式**: multipart/form-data
-- **参数**:
-  - `input_files`: 输入文件列表（支持多个文件）
-  - `instruction`: 必填，抽取指令（描述要提取的字段信息）
-  - `model_type`: 可选，模型类型（`ollama`、`openai`、`qwen`、`deepseek`），默认使用环境变量 `A23_MODEL_TYPE` 配置
-  - `llm_mode`: 可选，LLM抽取模式，可选值：'full'（始终全文抽取，默认）、'supplement'（仅补充缺失字段）、'off'（仅规则抽取）（默认 'full'）
-  - `enable_unit_aware`: 可选，启用单位感知提取（默认 `true`）
-  - `total_timeout`: 可选，总超时时间（秒），默认110秒
-  - `max_chunks`: 可选，最大语义分块数量，默认50
-  - `quiet`: 可选，安静模式，禁用控制台输出，默认False
-- **响应**: 与直接抽取API响应格式相同
-- **特点**: 无需模板文件，仅通过指令描述要提取的字段，由LLM自动推断字段结构并抽取。
+## 5) pipeline_routing（排障与观测）
 
-### 5. 文档 QnA
-- POST `/api/qna/ask`
+抽取响应中的 `metadata`/`slicing_metadata` 包含 `pipeline_routing`（由 `src/core/extraction_routing.py` 生成）：
+- 输入类型（后缀、`input_kind`）
+- 主路由（`primary_track`）
+- 多表 Word 分支信息
+- 阶段标签 `stages`
 
-## 基准任务路径（中文命名）
-- 基准清单：`test/assets/清单/基准任务清单.json`
-- 模板目录：`test/assets/模板`
-- 输入目录：`test/assets/任务输入`
-- 标准答案：`test/assets/标准答案`
-- 批处理输出：`test/results/outputs`
+该字段用于排障与链路观测，不影响业务消费逻辑。

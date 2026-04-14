@@ -1,9 +1,9 @@
 # 批量测试使用说明（新架构版）
 
 ## 新架构核心参数
-- `--llm-mode {full|supplement|off}`: LLM抽取模式
+- `--llm-mode {full|off}`: LLM抽取模式（`supplement` 兼容映射到 `full`）
   - `full`: 始终全文抽取（默认，Docling语义分块 + LLM）
-  - `supplement`: 仅补充缺失字段（规则预抽取 + AI补充）
+  - `supplement`: 兼容别名，等价于 `full`
   - `off`: 仅规则抽取（替代旧的`--use-rules-only`）
 - `--total-timeout N`: 总超时时间（秒），默认110秒
 - `--max-chunks N`: 最大语义分块数量，默认50

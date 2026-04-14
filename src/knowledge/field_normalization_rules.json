@@ -22,6 +22,34 @@
     "初步统计",
     "预测值?"
   ],
+  "field_interpreter": {
+    "negation_cues": [
+      "无",
+      "未见",
+      "未发现",
+      "未报告",
+      "未检出",
+      "没有",
+      "并无",
+      "暂无",
+      "尚无",
+      "缺失",
+      "缺省",
+      "none",
+      "no ",
+      "not ",
+      "not found",
+      "not reported",
+      "not detected",
+      "not available"
+    ],
+    "zero_units": ["例", "起", "人", "次", "件", "项", "%", "万", "亿", "千"],
+    "zero_context_hints": ["新增", "发生", "报告", "检出", "发现", "增长", "变化", "cases?", "incidents?"],
+    "date_context_chars": ["年", "月", "日", "/"],
+    "snippet_window": 520,
+    "keyword_context_before": 24,
+    "keyword_context_after": 40
+  },
   "types": {
     "numeric": {
       "extract_number_regex": "\\d+(?:\\.\\d+)?",

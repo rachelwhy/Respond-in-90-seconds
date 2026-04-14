@@ -260,31 +260,7 @@ def _build_example_from_profile(profile: dict) -> Any:
         _dprint(f"_build_example_from_profile: _example_text_len={len(profile['_example_text'])}")
     from langextract.data import ExampleData, Extraction
 
-    # 优先使用 LLM 生成的真实示例
-    # 暂时禁用真实示例，使用虚构示例以测试 langextract
-    # if profile.get("_example") and profile.get("_example_text"):
-    #     ex_attrs = profile["_example"]
-    #     ex_text = profile["_example_text"]
-    #
-    #     if ex_attrs and isinstance(ex_attrs, dict) and ex_text:
-    #         # 提取第一个属性值作为 extraction_text
-    #         first_value = next(iter(ex_attrs.values())) if ex_attrs else ""
-    #         print(f"[DEBUG _build_example_from_profile] 使用真实示例，first_value={first_value}, type={type(first_value)}")
-    #         extraction_text = str(first_value) if first_value is not None else ""
-    #         print(f"[DEBUG _build_example_from_profile] extraction_text={extraction_text}")
-    #
-    #         return ExampleData(
-    #             text=ex_text,
-    #             extractions=[
-    #                 Extraction(
-    #                     extraction_class="record",
-    #                     extraction_text=extraction_text,
-    #                     attributes=ex_attrs
-    #                 )
-    #             ]
-    #         )
-
-    # 回退：原有的规则生成逻辑
+    # 使用规则化示例生成，避免在缺少稳定真实样本时引入不确定性。
     fields = profile.get("fields", [])
     if not fields:
         return None
@@ -333,6 +309,21 @@ def _build_example_from_profile(profile: dict) -> Any:
             )
         ],
     )
+
+
+def _build_resolver_params(is_cloud: bool) -> Dict[str, Any]:
+    """
+    构建 langextract resolver 对齐参数。
+    - 云模型：适度提升对齐阈值，抑制宽松匹配导致的语义上卷。
+    - 本地模型：保持更保守的默认。
+    """
+    threshold = 0.88 if is_cloud else 0.82
+    return {
+        "enable_fuzzy_alignment": True,
+        "fuzzy_alignment_threshold": threshold,
+        "accept_match_lesser": False,
+        "suppress_parse_errors": True,
+    }
 
 
 def _optimize_chunks(text_chunks: List[Dict], is_cloud: bool, quiet: bool = False) -> List[Dict]:
@@ -483,6 +474,7 @@ def _extract_with_langextract_direct(
             "extraction_passes": 1,
             "context_window_chars": 300 if is_cloud else 150,
             "batch_length": 5 if is_cloud else 4,
+            "resolver_params": _build_resolver_params(is_cloud),
         }
 
         if not quiet:
@@ -897,6 +889,7 @@ def _convert_result_to_records(
             continue
         for ext in doc.extractions:
             attrs = ext.attributes or {}
+            anchor_text = str(getattr(ext, "extraction_text", "") or "").strip()
             
             _dprint(f"_convert_result_to_records: attrs_keys={list(attrs.keys())}")
             
@@ -914,6 +907,68 @@ def _convert_result_to_records(
                             break
                     if not matched:
                         record[fname] = ""
+            if anchor_text:
+                record["_anchor_text"] = anchor_text
             records.append(record)
 
-    return records
+    return _apply_anchor_backfill_records(records, field_names)
+
+
+def _is_usable_anchor_text(text: str) -> bool:
+    s = str(text or "").strip()
+    if not s:
+        return False
+    # 避免把整句/长片段当作实体名写回字段
+    if len(s) > 40:
+        return False
+    if any(ch in s for ch in ("\n", "。", "；", ";", "，", ",")):
+        return False
+    return True
+
+
+def _apply_anchor_backfill_records(records: List[Dict], field_names: List[str]) -> List[Dict]:
+    """
+    当首要标识字段被模型过度概括（大量记录同值）时，用 extraction_text 回填更细粒度实体名。
+    该策略不依赖任何领域词典，仅依据“记录锚点多样性 vs 字段单一值”判断。
+    """
+    rows = [dict(r) for r in records if isinstance(r, dict)]
+    if not rows or not field_names:
+        return rows
+
+    target_field = str(field_names[0]).strip()
+    if not target_field:
+        return rows
+
+    anchors = [str(r.get("_anchor_text", "")).strip() for r in rows]
+    usable_anchors = [a for a in anchors if _is_usable_anchor_text(a)]
+    distinct_anchors = {a for a in usable_anchors if a}
+    if len(distinct_anchors) < 3:
+        for r in rows:
+            r.pop("_anchor_text", None)
+        return rows
+
+    target_values = [str(r.get(target_field, "")).strip() for r in rows]
+    non_empty_values = [v for v in target_values if v]
+    unique_values = set(non_empty_values)
+
+    # 目标字段几乎单值，而锚点明显多样，判定为“语义上卷”。
+    if len(unique_values) > 1:
+        for r in rows:
+            r.pop("_anchor_text", None)
+        return rows
+
+    changed = 0
+    for r in rows:
+        anchor = str(r.get("_anchor_text", "")).strip()
+        if not _is_usable_anchor_text(anchor):
+            r.pop("_anchor_text", None)
+            continue
+        cur = str(r.get(target_field, "")).strip()
+        if (not cur) or (cur in unique_values):
+            r[target_field] = anchor
+            changed += 1
+        r.pop("_anchor_text", None)
+
+    if changed and not _debug_enabled():
+        logger.info("langextract: 锚点回填已应用，字段=%s，回填记录=%s", target_field, changed)
+    return rows

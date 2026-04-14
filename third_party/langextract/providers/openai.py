@@ -19,6 +19,8 @@ from __future__ import annotations
 
 import concurrent.futures
 import dataclasses
+import logging
+import os
 from typing import Any, Iterator, Sequence
 
 from langextract.core import base_model
@@ -28,6 +30,13 @@ from langextract.core import schema
 from langextract.core import types as core_types
 from langextract.providers import patterns
 from langextract.providers import router
+
+logger = logging.getLogger(__name__)
+
+
+def _debug_enabled() -> bool:
+  v = os.environ.get("A23_DEBUG", "").strip().lower()
+  return v in ("1", "true", "yes", "on", "y")
 
 
 @router.register(
@@ -120,8 +129,16 @@ class OpenAILanguageModel(base_model.BaseLanguageModel):
           self.base_url = self.base_url.rstrip("/") + "/v1"
 
     # Initialize the OpenAI client
-    print(f"[DEBUG OpenAILanguageModel.__init__] base_url={repr(self.base_url)}, type={type(self.base_url)}")
-    print(f"[DEBUG OpenAILanguageModel.__init__] api_key前5位={self.api_key[:5] if self.api_key else 'None'}")
+    if _debug_enabled():
+      logger.debug(
+          "OpenAILanguageModel.__init__: base_url=%r type=%s",
+          self.base_url,
+          type(self.base_url),
+      )
+      logger.debug(
+          "OpenAILanguageModel.__init__: api_key_prefix=%s",
+          self.api_key[:5] if self.api_key else "None",
+      )
     self._client = openai.OpenAI(
         api_key=self.api_key,
         base_url=self.base_url,
@@ -205,7 +222,8 @@ class OpenAILanguageModel(base_model.BaseLanguageModel):
 
       if is_custom:
         # 自定义 provider（DeepSeek、Qwen 等）：支持基础 JSON mode
-        print(f"[DEBUG] 使用自定义 provider 模式，启用 response_format")
+        if _debug_enabled():
+          logger.debug("custom provider mode: enable response_format")
 
         # ✅ 自定义 provider 支持 json_object 模式（根据测试结果）
         if self.format_type == data.FormatType.JSON:
@@ -250,11 +268,14 @@ class OpenAILanguageModel(base_model.BaseLanguageModel):
             api_params[key] = v
 
       # ✅ 添加调试日志
-      if is_custom:
-        print(f"[DEBUG] API 请求参数（自定义 provider）: model={api_params.get('model')}, "
-              f"temperature={api_params.get('temperature')}, "
-              f"max_tokens={api_params.get('max_tokens')}, "
-              f"response_format={api_params.get('response_format')}")
+      if is_custom and _debug_enabled():
+        logger.debug(
+            "custom provider request: model=%s temperature=%s max_tokens=%s response_format=%s",
+            api_params.get("model"),
+            api_params.get("temperature"),
+            api_params.get("max_tokens"),
+            api_params.get("response_format"),
+        )
 
       response = self._client.chat.completions.create(**api_params)
 
@@ -262,8 +283,8 @@ class OpenAILanguageModel(base_model.BaseLanguageModel):
       output_text = response.choices[0].message.content
 
       # ✅ 调试：打印返回内容的前200字符
-      if is_custom and output_text:
-        print(f"[DEBUG] API 返回（前200字符）: {output_text[:200]}")
+      if is_custom and output_text and _debug_enabled():
+        logger.debug("custom provider response head: %s", output_text[:200])
 
       return core_types.ScoredOutput(score=1.0, output=output_text)
 

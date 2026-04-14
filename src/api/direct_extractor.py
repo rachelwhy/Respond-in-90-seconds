@@ -11,17 +11,208 @@ from __future__ import annotations
 import json
 import logging
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from src.core.profile import generate_profile_from_template, generate_profile_from_document
-from src.core.reader import collect_input_bundle, try_internal_structured_extract
+from src.core.profile import (
+    generate_profile_from_template,
+    generate_profile_from_document,
+    apply_instruction_runtime_hints,
+    apply_word_multi_instruction_constraints,
+)
+from src.core.reader import collect_input_bundle, collect_semantic_chunks_from_bundle, try_internal_structured_extract
 from src.core.postprocess import process_by_profile, validate_required_fields
 from src.core.extractor import UniversalExtractor
-from src.core.writers import create_excel_from_records
+from src.core.writers import create_excel_from_records, fill_excel_table, fill_excel_vertical, fill_word_table
 from src.core.deadline_context import create_deadline_context
+from src.core.llm_mode import normalize_llm_mode
+from src.core.model_availability import detect_model_readiness
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class ExtractFlowState:
+    records_list: List[Any]
+    text: str
+    effective_llm_mode: str
+    requested_llm_mode: str
+    llm_mode_normalized: str
+    readiness: Dict[str, object]
+    langextract_used: bool = False
+    parallel_extracted: bool = False
+    processed_bundle: Optional[Dict[str, Any]] = None
+
+
+def _resolve_llm_mode_with_fallback(
+    llm_mode: str,
+    model_type: Optional[str],
+    quiet: bool,
+) -> tuple[str, str, str, Dict[str, object]]:
+    requested_llm_mode = llm_mode
+    llm_mode_norm = normalize_llm_mode(llm_mode)
+    readiness = detect_model_readiness(model_type, check_ollama=True)
+    fallback_rule_only = llm_mode_norm != "off" and not bool(readiness.get("ready"))
+    effective_llm_mode = "off" if (llm_mode_norm == "off" or fallback_rule_only) else llm_mode_norm
+    if fallback_rule_only and not quiet:
+        logger.warning(
+            "模型不可用，自动降级为纯规则抽取：model=%s, reason=%s",
+            readiness.get("model_type"),
+            readiness.get("reason"),
+        )
+    return requested_llm_mode, llm_mode_norm, effective_llm_mode, readiness
+
+
+def _run_word_multi_parallel_stage(
+    profile: Dict[str, Any],
+    bundle: Dict[str, Any],
+    state: ExtractFlowState,
+    *,
+    total_timeout: int,
+    max_chunks: int,
+    quiet: bool,
+) -> None:
+    if state.effective_llm_mode == "off":
+        return
+    from src.core.extraction_service import get_extraction_service
+    from src.core.extraction_routing import is_word_multi_parallel_enabled
+    from src.core.word_multi_segments import build_word_multi_table_segments
+
+    if not is_word_multi_parallel_enabled(profile):
+        return
+
+    ctx = state.text or ""
+    if len(ctx) > 24000:
+        ctx = ctx[:24000]
+        if not quiet:
+            logger.info("direct_extract: 正文截断至 24000 字符")
+
+    segs = build_word_multi_table_segments(profile, ctx, bundle.get("documents") or [])
+    svc = get_extraction_service()
+    _chunks = collect_semantic_chunks_from_bundle(bundle)
+    chunks_arg = _chunks if _chunks else None
+    extracted_raw, _mo, meta = svc.extract_with_slicing(
+        text=ctx,
+        profile=profile,
+        use_model=True,
+        show_progress=not quiet,
+        time_budget=total_timeout,
+        chunks=chunks_arg,
+        max_chunks=max_chunks,
+        logger=logger if not quiet else None,
+        word_table_segments=segs,
+        routing_bundle=bundle,
+    )
+    extracted_for_post = dict(extracted_raw)
+    extracted_for_post["_source_text"] = state.text
+    processed_bundle = process_by_profile(extracted_for_post, profile)
+    if (
+        profile.get("template_mode") == "word_multi_table"
+        and isinstance(processed_bundle, dict)
+        and processed_bundle.get("_table_groups")
+    ):
+        from src.core.word_multi_internal_merge import merge_internal_structured_into_word_multi_groups
+
+        processed_bundle = merge_internal_structured_into_word_multi_groups(
+            processed_bundle, profile, bundle
+        )
+    state.records_list = list(processed_bundle.get("records") or [])
+    state.parallel_extracted = True
+    state.langextract_used = True
+    state.processed_bundle = processed_bundle
+    if not quiet:
+        logger.info("direct_extract: word_multi_parallel 完成 meta=%s", meta)
+
+
+def _run_langextract_stage(
+    profile: Dict[str, Any],
+    bundle: Dict[str, Any],
+    state: ExtractFlowState,
+    *,
+    total_timeout: int,
+    max_chunks: int,
+    quiet: bool,
+) -> None:
+    if state.langextract_used or state.effective_llm_mode == "off":
+        return
+    try:
+        from src.adapters.langextract_adapter import extract_with_langextract
+
+        chunks = ensure_chunks(bundle, quiet=quiet)
+        original_count = len(chunks)
+
+        total_chars = sum(len(chunk.get("text", "")) for chunk in chunks)
+        if total_chars > 20000:
+            target_size = 8000
+        elif total_chars > 10000:
+            target_size = 6000
+        else:
+            target_size = 4000
+
+        if max_chunks and original_count > max_chunks:
+            chunks = chunks[:max_chunks]
+            if not quiet:
+                logger.info(f"限制分块数: {original_count} -> {len(chunks)} (max_chunks={max_chunks})")
+
+        text_chunks = merge_chunks(chunks, target_size=target_size)
+        if not quiet:
+            logger.info(
+                "分块合并: %s -> %s 块, 目标大小=%s字符, 总字符=%s",
+                original_count,
+                len(text_chunks),
+                target_size,
+                total_chars,
+            )
+        logger.info("准备调用 langextract，块数: %s", len(text_chunks))
+        lx_records = extract_with_langextract(
+            text_chunks,
+            profile,
+            time_budget=total_timeout,
+            quiet=quiet,
+        )
+        if lx_records is not None and len(lx_records) > 0:
+            if not quiet:
+                logger.info("langextract 提取成功: %s 条记录", len(lx_records))
+            state.records_list = (state.records_list or []) + list(lx_records)
+            state.langextract_used = True
+    except Exception as e:
+        logger.info(f"langextract 不可用: {e}")
+        import traceback
+        logger.info(f"异常详情: {traceback.format_exc()}")
+
+
+def _run_prompt_llm_stage(
+    profile: Dict[str, Any],
+    state: ExtractFlowState,
+    *,
+    model_type: Optional[str],
+    total_timeout: int,
+    max_chunks: int,
+    quiet: bool,
+) -> None:
+    if state.langextract_used or state.effective_llm_mode == "off":
+        return
+    deadline_ctx = create_deadline_context(
+        name=f"direct_extract_{int(time.time())}",
+        timeout_seconds=total_timeout if total_timeout > 0 else None,
+    )
+    config = {
+        "llm_mode": state.llm_mode_normalized,
+        "total_timeout": total_timeout,
+        "max_chunks": max_chunks,
+        "quiet": quiet,
+        "total_deadline": time.time() + total_timeout if total_timeout else None,
+        "deadline_context": deadline_ctx,
+    }
+    if model_type:
+        config["model_type"] = model_type
+    extractor = UniversalExtractor(config=config)
+    result = extractor.extract(state.text, profile)
+    if state.records_list:
+        state.records_list = state.records_list + list(result.records)
+    else:
+        state.records_list = list(result.records)
 
 
 def merge_chunks(chunks: List[Dict], target_size: int = 6000) -> List[Dict]:
@@ -175,7 +366,7 @@ def direct_extract(
         input_dir: 输入文档目录
         model_type: 模型类型（ollama / deepseek / openai），None 则用配置
         instruction: 补充抽取指令（可选）
-        llm_mode: LLM抽取模式，可选值：'full'（始终全文抽取，默认）、'supplement'（仅补充缺失字段）
+        llm_mode: LLM抽取模式，可选值：'full'（默认）、'off'（纯规则）。'supplement' 会兼容映射为 'full'
         enable_unit_aware: 是否启用单位感知（预留，暂不影响主流程）
         work_dir: 可选的工作空间目录（持久化场景由调用方提供，None 则无输出落盘）
         total_timeout: 总超时时间（秒），默认110秒
@@ -189,8 +380,6 @@ def direct_extract(
         }
     """
     try:
-        # 0. 模型可用性检查（已跳过，因为 Ollama 返回非 JSON 导致误判）
-        pass
         # 1. 加载文档（先加载，因为无模板时需要文档内容来生成profile）
         bundle = collect_input_bundle(input_dir)
         if not quiet:
@@ -209,91 +398,57 @@ def direct_extract(
                 logger.info(f"文档自动分析结果: {doc_type}, 字段数: {len(profile.get('fields', []))}")
 
         # 3. 先尝试结构化表格提取（Docling DataFrame）
-        records = try_internal_structured_extract(profile, bundle)
+        internal_raw = try_internal_structured_extract(profile, bundle)
+        records_list: List = []
+        if isinstance(internal_raw, dict):
+            records_list = list(internal_raw.get("records") or [])
+        elif isinstance(internal_raw, list):
+            records_list = internal_raw
 
-        # 4. 优先尝试 langextract（云 API 或大模型时更快更精确）
-        import time
         text = bundle.get("all_text", "")
-        langextract_used = False
-        try:
-            from src.adapters.langextract_adapter import extract_with_langextract
-            # 确保有 chunks（健壮的兜底逻辑）
-            chunks = ensure_chunks(bundle, quiet=quiet)
+        requested_llm_mode, llm_mode_norm, effective_llm_mode, readiness = _resolve_llm_mode_with_fallback(
+            llm_mode, model_type, quiet
+        )
+        state = ExtractFlowState(
+            records_list=list(records_list or []),
+            text=text,
+            effective_llm_mode=effective_llm_mode,
+            requested_llm_mode=requested_llm_mode,
+            llm_mode_normalized=llm_mode_norm,
+            readiness=readiness,
+        )
 
-            # 应用分块合并优化
-            original_count = len(chunks)
+        # 4. 主线编排：并行多表 -> langextract -> prompt（按需短路）
+        _run_word_multi_parallel_stage(
+            profile,
+            bundle,
+            state,
+            total_timeout=total_timeout,
+            max_chunks=max_chunks,
+            quiet=quiet,
+        )
+        _run_langextract_stage(
+            profile,
+            bundle,
+            state,
+            total_timeout=total_timeout,
+            max_chunks=max_chunks,
+            quiet=quiet,
+        )
+        _run_prompt_llm_stage(
+            profile,
+            state,
+            model_type=model_type,
+            total_timeout=total_timeout,
+            max_chunks=max_chunks,
+            quiet=quiet,
+        )
 
-            # 根据文档长度动态调整目标分块大小
-            total_chars = sum(len(chunk.get("text", "")) for chunk in chunks)
-            if total_chars > 20000:  # 长文档
-                target_size = 8000
-            elif total_chars > 10000:  # 中长文档
-                target_size = 6000
-            else:  # 短文档
-                target_size = 4000
+        records = state.records_list or []
 
-            # 限制最大分块数（如果设置了 max_chunks）
-            if max_chunks and original_count > max_chunks:
-                # 保持文档阅读顺序：直接截断前 N 个分块
-                # 说明：此前“按长度挑选长分块”会打乱顺序，且可能跳过文档尾部导致记录顺序/覆盖不稳定。
-                chunks = chunks[:max_chunks]
-                if not quiet:
-                    logger.info(f"限制分块数: {original_count} -> {len(chunks)} (max_chunks={max_chunks})")
-
-            # 合并小分块
-            merged_chunks = merge_chunks(chunks, target_size=target_size)
-
-            text_chunks = merged_chunks
-            if not quiet:
-                logger.info(f"分块合并: {original_count} -> {len(text_chunks)} 块, 目标大小={target_size}字符, 总字符={total_chars}")
-
-            logger.info(f"准备调用 langextract，块数: {len(text_chunks)}")
-            lx_records = extract_with_langextract(
-                text_chunks, profile,
-                time_budget=total_timeout,
-                quiet=quiet,
-            )
-            if lx_records is not None and len(lx_records) > 0:
-                if not quiet:
-                    logger.info(f"langextract 提取成功: {len(lx_records)} 条记录")
-                records = (records or []) + lx_records
-                langextract_used = True
-        except Exception as e:
-            logger.info(f"langextract 不可用: {e}")
-            import traceback
-            logger.info(f"异常详情: {traceback.format_exc()}")
-
-        # 5. LLM抽取（langextract 未成功时回退到 prompt 方案）
-        if not langextract_used:
-            # 创建deadline上下文
-            deadline_ctx = create_deadline_context(
-                name=f"direct_extract_{int(time.time())}",
-                timeout_seconds=total_timeout if total_timeout > 0 else None
-            )
-
-            config = {
-                "llm_mode": llm_mode,
-                "total_timeout": total_timeout,
-                "max_chunks": max_chunks,
-                "quiet": quiet,
-                "total_deadline": time.time() + total_timeout if total_timeout else None,
-                "deadline_context": deadline_ctx
-            }
-            if model_type:
-                config["model_type"] = model_type
-            extractor = UniversalExtractor(config=config)
-            result = extractor.extract(text, profile)
-            if records:
-                records = records + result.records
-            else:
-                records = result.records
-
-        records = records or []
-
-        # 6. 后处理（字段标准化）- 重新启用
-        if records:
+        # 6. 后处理（字段标准化）；并行抽取已在 3b 中 process_by_profile
+        if records and not state.parallel_extracted:
             try:
-                from src.core.postprocess import process_by_profile
                 # 传入 Docling 阅读顺序全文，用于“按原文顺序”稳定排序
                 processed = process_by_profile({"records": records, "_source_text": text}, profile)
                 records = processed.get("records", records)
@@ -301,49 +456,102 @@ def direct_extract(
                     logger.info("后处理完成: %s 条记录", len(records))
             except Exception as e:
                 logger.warning(f"后处理失败，使用原始记录: {e}")
+        elif state.parallel_extracted and state.processed_bundle is not None:
+            records = list(state.processed_bundle.get("records") or records)
+            if not quiet:
+                logger.info("后处理已在 word_multi_parallel 路径完成: %s 条记录", len(records))
 
         output_file = None
-        # 智能文件输出：如果是结构化类型且 work_dir 存在，则生成表格文件
+        # 输出文件：有模板优先按模板写回；无模板则回退为动态 Excel。
         doc_type = profile.get("_doc_type", "")
-        if doc_type in ("structured_table", "structured_single") and work_dir is not None:
-            if records and isinstance(records, list) and len(records) > 0:
-                try:
-                    # 确保 work_dir 存在
-                    work_dir.mkdir(parents=True, exist_ok=True)
-                    # 根据输入文件类型决定输出格式（默认Excel）
-                    # 获取第一个输入文件的扩展名（如果有）
-                    first_file = None
-                    documents = bundle.get("documents", [])
-                    if documents and isinstance(documents, list) and len(documents) > 0:
-                        doc = documents[0]
-                        if isinstance(doc, dict) and "path" in doc:
-                            first_file = Path(doc["path"])
-                    # 决定输出格式（暂时只支持Excel，Word输出需要模板）
-                    # 生成Excel文件
-                    output_filename = f"extracted_{int(time.time())}.xlsx"
-                    output_path = work_dir / output_filename
+        if work_dir is not None and records and isinstance(records, list) and len(records) > 0:
+            try:
+                work_dir.mkdir(parents=True, exist_ok=True)
+                template_mode = profile.get("template_mode", "excel_table")
+                ts = int(time.time())
+                template_suffix = (Path(template_path).suffix or "").lower() if template_path else ""
+
+                if template_path and Path(template_path).exists() and template_suffix in (".xlsx", ".xls", ".xlsm"):
+                    output_path = work_dir / f"extracted_{ts}.xlsx"
+                    if template_mode == "vertical":
+                        vertical_data = records[0] if records and isinstance(records[0], dict) else {}
+                        fill_excel_vertical(str(template_path), str(output_path), vertical_data)
+                    else:
+                        fill_excel_table(
+                            template_path=str(template_path),
+                            output_path=str(output_path),
+                            records=records,
+                            header_row=int(profile.get("header_row", 1)),
+                            start_row=int(profile.get("start_row", 2)),
+                        )
+                    output_file = str(output_path)
+                    logger.info("按 Excel 模板写回成功: %s", output_file)
+
+                elif template_path and Path(template_path).exists() and template_suffix in (".docx", ".doc"):
+                    output_path = work_dir / f"extracted_{ts}.docx"
+                    fill_payload: Dict[str, Any]
+                    if (
+                        profile.get("template_mode") == "word_multi_table"
+                        and state.processed_bundle
+                        and isinstance(state.processed_bundle, dict)
+                        and state.processed_bundle.get("_table_groups")
+                    ):
+                        fill_payload = {
+                            "records": records,
+                            "_table_groups": state.processed_bundle.get("_table_groups"),
+                        }
+                    else:
+                        fill_payload = {"records": records}
+                    fill_word_table(
+                        template_path=str(template_path),
+                        output_path=str(output_path),
+                        records=fill_payload,
+                        table_index=int(profile.get("table_index", 0)),
+                        header_row=int(profile.get("header_row", 0)),
+                        start_row=int(profile.get("start_row", 1)),
+                    )
+                    output_file = str(output_path)
+                    logger.info("按 Word 模板写回成功: %s", output_file)
+
+                else:
+                    # 无模板或模板不可写回：回退动态 Excel
+                    output_path = work_dir / f"extracted_{ts}.xlsx"
                     create_excel_from_records(str(output_path), records)
                     output_file = str(output_path)
-                    logger.info(f"自动生成表格文件: {output_file}")
-                except Exception as e:
-                    logger.warning(f"生成输出文件失败: {e}")
-            else:
-                logger.info("无有效记录，跳过文件生成")
+                    logger.info("模板不可写回，回退动态 Excel: %s", output_file)
+            except Exception as e:
+                logger.warning(f"生成输出文件失败: {e}")
+        elif work_dir is not None:
+            logger.info("无有效记录，跳过文件生成")
 
         # 调试信息（可选）
         if not quiet and records and len(records) > 0:
             logger.info(f"提取完成: {len(records)} 条记录")
 
+        meta: Dict[str, Any] = {
+            "file_count": bundle.get("file_count", 0),
+            "record_count": len(records),
+            "template_mode": profile.get("template_mode", "unknown"),
+            "task_mode": profile.get("task_mode", "unknown"),
+            "doc_type": doc_type,
+            "profile_auto_generated": bool(profile.get("_doc_type")),
+            "word_multi_parallel": state.parallel_extracted,
+            "llm_mode_requested": state.requested_llm_mode,
+            "llm_mode_normalized": state.llm_mode_normalized,
+            "llm_mode_effective": state.effective_llm_mode,
+            "model_ready": bool(state.readiness.get("ready")),
+            "model_ready_reason": str(state.readiness.get("reason") or ""),
+        }
+        if (
+            state.parallel_extracted
+            and state.processed_bundle is not None
+            and state.processed_bundle.get("_table_groups")
+        ):
+            meta["_table_groups"] = state.processed_bundle.get("_table_groups")
+
         return {
             "records": records,
-            "metadata": {
-                "file_count": bundle.get("file_count", 0),
-                "record_count": len(records),
-                "template_mode": profile.get("template_mode", "unknown"),
-                "task_mode": profile.get("task_mode", "unknown"),
-                "doc_type": doc_type,
-                "profile_auto_generated": bool(profile.get("_doc_type")),
-            },
+            "metadata": meta,
             "output_file": output_file,
         }
 
@@ -381,6 +589,9 @@ def _load_profile(template_path: str, instruction: Optional[str], document_text:
                 user_description=instruction,
             )
             if profile and profile.get("fields"):
+                profile = apply_instruction_runtime_hints(profile, instruction or "")
+                if profile.get("template_mode") == "word_multi_table":
+                    profile = apply_word_multi_instruction_constraints(profile, profile.get("instruction", ""))
                 return profile
 
     # 模式2：无模板但有用户指令
@@ -393,14 +604,14 @@ def _load_profile(template_path: str, instruction: Optional[str], document_text:
             document_sample=document_text[:3000] if document_text else "",
         )
         if profile and profile.get("fields"):
-            return profile
+            return apply_instruction_runtime_hints(profile, instruction or "")
 
     # 模式3：无模板无指令 → 全自动文档分析
     if document_text and document_text.strip():
         logger.info("无模板无指令，启动文档自动分析...")
         profile = generate_profile_from_document(document_text)
         if profile and profile.get("fields"):
-            return profile
+            return apply_instruction_runtime_hints(profile, instruction or "")
 
     # 兜底
     from src.core.profile import _default_profile

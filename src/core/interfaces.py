@@ -25,7 +25,7 @@ class IExtractionService(ABC):
         Args:
             text: 输入文本
             profile: 抽取配置文件
-            llm_mode: 抽取模式，可选 "full"（全文抽取）、"supplement"（仅补充缺失字段）、"off"（仅规则抽取）
+            llm_mode: 抽取模式，可选 "full"（默认）/"off"（仅规则抽取），"supplement" 兼容映射为 "full"
             slice_size: 字符切片大小（仅在无语义分块时使用）
             overlap: 字符切片重叠大小（仅在无语义分块时使用）
             max_chunks: 最大处理分块数
@@ -65,7 +65,9 @@ class IExtractionService(ABC):
                              time_budget: int = 110,
                              chunks: list = None,
                              max_chunks: int = 50,
-                             logger=None):
+                             logger=None,
+                             word_table_segments: Optional[List[str]] = None,
+                             routing_bundle: Optional[Dict[str, Any]] = None):
         """使用切片模式进行抽取。优先使用 Docling 语义分块（chunks），回退到字符切片。
 
         Args:
@@ -79,6 +81,8 @@ class IExtractionService(ABC):
             chunks: Docling 语义分块列表（每个元素含 type 和 text 字段）
             max_chunks: 最多处理的 chunk 数量
             logger: 可选的 Python logger 实例
+            word_table_segments: 多表 Word 时每表一段源文档上下文
+            routing_bundle: collect_input_bundle 结果，用于 meta.pipeline_routing
 
         Returns:
             extracted_raw: 抽取结果字典

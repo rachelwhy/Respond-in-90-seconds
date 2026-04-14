@@ -57,6 +57,31 @@ def collect_input_bundle(input_dir: str) -> Dict[str, Any]:
     }
 
 
+def collect_semantic_chunks_from_bundle(loaded_bundle: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """从 `collect_input_bundle` 的 bundle 里按文档顺序合并语义分块。
+
+    **数据从哪来**
+
+    1. 输入为目录或单文件路径 → `collect_input_bundle` 逐文件选解析器（见 `parser_factory`）。
+    2. 非 ``.txt`` 走 **Docling**：`doc["chunks"]` 来自版式/Markdown 派生的分块，元素含 ``type``（如
+       ``text`` / ``table`` / ``formula``）与 ``text``。
+    3. ``.txt`` 走 **TextParser**：按段落拼块，``chunks`` 一般为 ``type=="text"``。
+
+    **用在哪**
+
+    - 传入 ``CoreExtractionService.extract_with_slicing(..., chunks=..., routing_bundle=bundle)``。
+    - 与 ``src.core.extraction_routing.build_pipeline_routing_meta`` 配合得到 ``meta.pipeline_routing``。
+
+    Returns:
+        扁平列表；可能为空列表。
+    """
+    out: List[Dict[str, Any]] = []
+    for doc in loaded_bundle.get("documents") or []:
+        if isinstance(doc, dict):
+            out.extend(doc.get("chunks") or [])
+    return out
+
+
 def collect_all_text(input_dir: str) -> str:
     """快捷方法：只返回合并后的文本"""
     return collect_input_bundle(input_dir).get("all_text", "")
@@ -71,6 +96,25 @@ def try_internal_structured_extract(profile: dict, loaded_bundle: Dict[str, Any]
     records = []
     template_fields = profile.get("fields", [])
     field_names = [f["name"] if isinstance(f, dict) else f for f in template_fields]
+
+    # 多表 Word 场景：为“分组过滤条件”补充辅助字段（如监测时间），
+    # 便于后续按约束精确分表；这些字段不要求必须写回模板。
+    helper_names = set()
+    if profile.get("template_mode") == "word_multi_table":
+        for spec in profile.get("table_specs") or []:
+            if not isinstance(spec, dict):
+                continue
+            ff = str(spec.get("filter_field", "")).strip()
+            if ff:
+                helper_names.add(ff)
+            for k in (spec.get("fixed_values") or {}).keys():
+                kk = str(k).strip()
+                if kk:
+                    helper_names.add(kk)
+    for hn in helper_names:
+        if hn not in field_names:
+            template_fields.append({"name": hn, "type": "text"})
+            field_names.append(hn)
 
     if not field_names:
         return None

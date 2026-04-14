@@ -113,6 +113,8 @@ NORMALIZATION_CONFIG = _get_env("NORMALIZATION_CONFIG", "src/knowledge/field_nor
 # ── langextract适配器配置 ─────────────────────────────────────────────────────
 LANGEXTRACT_PROVIDER_WORKERS = _get_env_int("LANGEXTRACT_PROVIDER_WORKERS", 1)
 LANGEXTRACT_MAX_CONCURRENT = _get_env_int("LANGEXTRACT_MAX_CONCURRENT", 2)
+# 多表 Word 并行后 LangExtract 补缺：未设=自动(同表头+有分块)；true=强制；false=关（见 word_multi_langextract_merge）
+WORD_MULTI_LANGEXTRACT = _get_env_bool("WORD_MULTI_LANGEXTRACT", False)
 
 # ── 去重配置 ────────────────────────────────────────────────────────────────
 SIMILARITY_THRESHOLD = _get_env_float("SIMILARITY_THRESHOLD", 0.85)

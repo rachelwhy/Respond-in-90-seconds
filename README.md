@@ -17,32 +17,37 @@ A23赛题算法后端：基于RAG的异构文档理解与信息抽取系统
 
 ## 目录结构（与当前仓库一致）
 
-> 详细技术流与模块说明见 [A23_TECHNICAL_FLOW.md](A23_TECHNICAL_FLOW.md)；优化与文档勘误见 [PROJECT_OPTIMIZATION_REPORT_2026.md](PROJECT_OPTIMIZATION_REPORT_2026.md)。
+> 详细技术流见 [A23_TECHNICAL_FLOW.md](A23_TECHNICAL_FLOW.md)；**全流程分支图（Mermaid）**见 [docs/RUNTIME_FLOW.md](docs/RUNTIME_FLOW.md)；**上线与接口**见 [HTTP_API_USAGE.md](HTTP_API_USAGE.md)；文档索引见 [docs/README.md](docs/README.md)。
 
 ```
 Respond in 90 seconds_A23/
-├── main.py                 # CLI 入口
-├── api_server.py           # FastAPI HTTP 入口
+├── main.py                 # CLI 调试 / 异步任务子进程入口（生产主路径为 HTTP API）
+├── api_server.py           # FastAPI（生产入口）
+├── docs/                   # 部署说明与文档索引
 ├── src/
 │   ├── adapters/           # 模型、Docling、解析器工厂、langextract 适配等
 │   ├── api/                # direct_extractor、task_manager、qna_service
-│   ├── core/               # 抽取服务、后处理、reader、writers、profile 等
+│   ├── core/               # 抽取服务、extraction_routing、后处理、reader、writers、profile 等
 │   ├── knowledge/          # 别名与归一化等知识资源
 │   └── config.py
-├── third_party/            # 可选：内嵌第三方库（如 langextract）
-├── tests/                  # （本地）单元 / 集成测试 — 默认不入库，见 .gitignore
-├── scripts/                # （本地）批处理 / 工具脚本 — 默认不入库
+├── third_party/            # 内嵌第三方（如 langextract）
+├── tests/                  # 单元 / 集成 — .gitignore 可能忽略，按团队规范
+├── scripts/                # 批处理 / 调试脚本
 ├── profiles/               # 模板 profile 示例
-├── storage/                # API 任务与上传持久化（可按环境忽略）
+├── storage/                # API 任务与上传持久化
 ├── requirements.txt
 ├── CLAUDE.md
 ├── A23_TECHNICAL_FLOW.md
 ├── HTTP_API_USAGE.md
 ├── HOW_TO_USE_BATCH.md
-├── PROJECT_OPTIMIZATION_REPORT_2026.md
 ├── install_windows_dependencies.bat
 └── start_api_windows.bat
 ```
+
+## 生产与调试
+
+- **内网网页 / 后端集成**：以 **`api_server`** + `HTTP_API_USAGE.md` 为准；同步抽取走 `direct_extractor`，异步任务走 `task_manager`。
+- **命令行 `main.py` 与 `scripts/`**：用于本地调试、批测，**不作为唯一运行形态**；与 API 共用 `src/core` 抽取核心。
 
 ## 安装
 
@@ -120,8 +125,8 @@ python main.py \
 # 纯规则抽取模式
 python main.py --llm-mode off ...
 
-# 补充抽取模式（规则预抽取 + AI补充缺失字段）
-python main.py --llm-mode supplement ...
+# 兼容模式（supplement 会映射为 full）
+python main.py --llm-mode supplement ... # 等价于 --llm-mode full
 
 # 完整AI抽取模式（默认，Docling语义分块 + LLM）
 python main.py --llm-mode full ...
@@ -154,8 +159,10 @@ uvicorn api_server:app --host 0.0.0.0 --port 8000
 | `/api/tasks/create` | POST | 创建异步任务（multipart） |
 | `/api/tasks/{task_id}` | GET | 任务状态与输出路径 |
 | `/api/tasks/{task_id}/result` | GET | 任务结果摘要 |
+| `/api/tasks/{task_id}/export-complete` | POST | 后端确认导出后清理任务 |
 | `/api/extract/direct` | POST | 同步直接抽取 |
 | `/api/extract/no-template` | POST | 无模板抽取 |
+| `/api/download/temp/{filename}/export-complete` | POST | 后端确认临时导出已接收并删除 |
 | `/api/qna/ask` | POST | 文档问答（可选 LangChain） |
 
 详细说明见 [HTTP_API_USAGE.md](HTTP_API_USAGE.md)
@@ -165,7 +172,14 @@ uvicorn api_server:app --host 0.0.0.0 --port 8000
 - **`A23_ENABLE_TASKS`**：为 `false` 时 `/api/tasks/*` 不可用。
 - **`A23_PERSIST_UPLOADS` / `A23_PERSIST_PROFILES`**：是否持久化上传与自动生成 profile。
 - **`A23_TASK_RETENTION_HOURS` 等**：任务与上传目录清理策略（小时）。
+- **`A23_DEBUG`**：调试模式；`report_bundle` 调试产物仅在调试链路开放。
 - 异步任务由子进程执行 `main.py`；子进程设置 **`PYTHONUNBUFFERED=1`** 便于日志落盘。外层 watchdog 约为 **`total_timeout + 300` 秒**（缓冲），与 `main.py --total-timeout` 配合使用。
+
+### 后端对接输出约定
+
+- 对外返回的 `output_files` 默认不包含 `report_bundle`。
+- 业务侧应使用 `result_json/result_xlsx`（或 `by_input`）进行消费。
+- `/api/extract/no-template` 生成结构化文件时会返回 `download_url`，后端拉取完成后可调用导出确认接口触发清理。
 
 ## Profile配置示例
 

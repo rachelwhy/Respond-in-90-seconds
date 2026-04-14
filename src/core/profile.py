@@ -11,6 +11,7 @@ from typing import Optional, Dict, Any
 
 from src.core.template_detector import detect_template_structure
 from src.core.alias import resolve_field_names
+from src.core.instruction_filters import parse_date_range_from_instruction
 
 logger = logging.getLogger(__name__)
 
@@ -117,6 +118,164 @@ def _enrich_fields(raw_fields: list, resolved_fields: list) -> tuple:
     return fields, dedup_key_fields
 
 
+def enrich_word_multi_table_specs(table_specs: list) -> None:
+    """为每个 Word 表生成子 profile（table_profile）与内置抽取段落（builtin_prompt）。
+
+    与表数量一一对应：几个表就有几个 table_profile 和几段 builtin_prompt。
+    """
+    for i, spec in enumerate(table_specs):
+        if not isinstance(spec, dict):
+            continue
+        raw = spec.get("field_names") or []
+        if not raw:
+            continue
+        resolved = resolve_field_names(raw)
+        fields, dedup_key_fields = _enrich_fields(raw, resolved)
+        idx = int(spec.get("table_index", i))
+        above = (spec.get("instruction_above") or "").strip()
+        instr = f"从源文档中提取可填入第 {idx + 1} 张 Word 表的数据（列名：{'、'.join(resolved[:32])}）"
+        if above:
+            instr += f"。表上方说明：{above[:500]}"
+        tp: Dict[str, Any] = {
+            "table_index": idx,
+            "fields": fields,
+            "instruction": instr,
+        }
+        if dedup_key_fields:
+            tp["dedup_key_fields"] = dedup_key_fields
+        spec["table_profile"] = tp
+
+        type_hint = []
+        for f in fields:
+            d: Dict[str, Any] = {"name": f["name"], "type": f.get("type", "text")}
+            if f.get("unit"):
+                d["unit"] = f["unit"]
+            type_hint.append(d)
+        lines = [
+            f"【第 {idx + 1} 张表 · 内置抽取提示】",
+            f"表上方说明：{above}" if above else "表上方说明：（无）",
+            f"本表列名（JSON 字段名须与下列一致，全局为各表并集）：{json.dumps(resolved, ensure_ascii=False)}",
+            f"本表字段类型：{json.dumps(type_hint, ensure_ascii=False)}",
+            "抽取时请结合本段说明理解该表语义；输出仍为全局 records，键为所有表列名并集，不适用的键填空字符串。",
+        ]
+        spec["builtin_prompt"] = "\n".join(lines)
+
+
+_CN_NUM_MAP = {
+    "一": 1, "二": 2, "三": 3, "四": 4, "五": 5,
+    "六": 6, "七": 7, "八": 8, "九": 9, "十": 10,
+}
+
+
+def _table_no_to_index(token: str) -> Optional[int]:
+    t = str(token or "").strip()
+    if not t:
+        return None
+    if t.isdigit():
+        v = int(t)
+        return v - 1 if v > 0 else None
+    if t in _CN_NUM_MAP:
+        return _CN_NUM_MAP[t] - 1
+    return None
+
+
+def _extract_table_blocks(instruction: str) -> Dict[int, str]:
+    text = str(instruction or "")
+    if not text.strip():
+        return {}
+    blocks: Dict[int, str] = {}
+    pattern = re.compile(
+        r"(?:^|\n)\s*表([一二三四五六七八九十\d]+)\s*[：:]\s*(.*?)(?=(?:\n\s*表[一二三四五六七八九十\d]+\s*[：:])|\Z)",
+        re.S,
+    )
+    for m in pattern.finditer(text):
+        idx = _table_no_to_index(m.group(1))
+        if idx is None:
+            continue
+        blocks[idx] = (m.group(2) or "").strip()
+    return blocks
+
+
+def apply_word_multi_instruction_constraints(profile: dict, instruction: str) -> dict:
+    """把用户指令中的“分表约束”注入 table_specs（如城市/监测时间）。"""
+    if not isinstance(profile, dict):
+        return profile
+    if profile.get("template_mode") != "word_multi_table":
+        return profile
+
+    specs = profile.get("table_specs")
+    if not isinstance(specs, list) or not specs:
+        return profile
+
+    blocks = _extract_table_blocks(instruction or "")
+    if not blocks:
+        return profile
+
+    city_re = re.compile(r"城市\s*[：:]\s*([^\s，,；;。]+)")
+    time_re = re.compile(r"监测时间\s*[：:]\s*([^\n\r，,；;。]+)")
+    out_specs = []
+    for i, spec in enumerate(specs):
+        if not isinstance(spec, dict):
+            out_specs.append(spec)
+            continue
+        block = blocks.get(i, "")
+        if not block:
+            out_specs.append(spec)
+            continue
+        sp = dict(spec)
+        fixed = dict(sp.get("fixed_values") or {})
+
+        city_m = city_re.search(block)
+        if city_m:
+            city = city_m.group(1).strip()
+            if city:
+                sp["filter_field"] = "城市"
+                sp["filter_value"] = city
+                fixed["城市"] = city
+
+        time_m = time_re.search(block)
+        if time_m:
+            mt = time_m.group(1).strip()
+            if mt:
+                fixed["监测时间"] = mt
+
+        if fixed:
+            sp["fixed_values"] = fixed
+        out_specs.append(sp)
+
+    out = dict(profile)
+    out["table_specs"] = out_specs
+    return out
+
+
+def apply_instruction_runtime_hints(profile: dict, instruction: str) -> dict:
+    """
+    根据用户指令为 profile 注入通用运行时提示（不改变用户原始语义）。
+    当前仅做日期范围信号增强：若指令含日期区间且字段未覆盖日期，则补充日期字段。
+    """
+    if not isinstance(profile, dict):
+        return profile
+
+    instr = str(instruction or "").strip()
+    out = dict(profile)
+    if instr:
+        out["instruction"] = instr
+
+    task_mode = out.get("task_mode", "single_record")
+    if task_mode != "table_records":
+        return out
+    if not parse_date_range_from_instruction(out.get("instruction", "")):
+        return out
+
+    fields = out.get("fields", [])
+    if not isinstance(fields, list):
+        fields = []
+    names = {str(f.get("name", "")).strip() for f in fields if isinstance(f, dict)}
+    if not any(n in names for n in ("日期", "统计日期", "监测时间", "时间", "date", "Date", "DATE")):
+        out["fields"] = list(fields) + [{"name": "日期", "type": "text"}]
+    return out
+
+
 def generate_profile_from_template(
     template_path: str = None,
     use_llm: bool = False,
@@ -135,16 +294,27 @@ def generate_profile_from_template(
 
             fields, dedup_key_fields = _enrich_fields(raw_fields, resolved)
 
+            instruction = _default_instruction(detected.get("task_mode", "table_records"), resolved)
+            if detected.get("template_mode") == "word_multi_table" and detected.get("table_specs"):
+                enrich_word_multi_table_specs(detected["table_specs"])
+                instruction = _default_instruction_word_multi(resolved, detected["table_specs"])
+
             profile = {
                 "report_name": Path(template_path).stem,
                 "template_path": _rel_path(template_path),
-                "instruction": _default_instruction(detected.get("task_mode", "table_records"), resolved),
+                "instruction": instruction,
                 "task_mode": detected.get("task_mode", "table_records"),
                 "template_mode": detected.get("template_mode", "excel_table"),
                 "fields": fields,
             }
             if dedup_key_fields:
                 profile["dedup_key_fields"] = dedup_key_fields
+            if detected.get("template_mode") == "word_multi_table" and detected.get("table_specs"):
+                profile["table_profiles"] = [
+                    s["table_profile"] for s in detected["table_specs"]
+                    if isinstance(s, dict) and "table_profile" in s
+                ]
+                profile["word_multi_parallel"] = True
             profile.update({k: v for k, v in detected.items() if k not in profile})
             return profile
         except Exception as e:
@@ -501,6 +671,29 @@ def _default_instruction(task_mode: str, fields) -> str:
     if task_mode == "table_records":
         return f"从文档表格中逐行提取记录，包含字段：{names}"
     return f"从文档中提取以下信息：{names}"
+
+
+def _default_instruction_word_multi(resolved: list, table_specs: list) -> str:
+    """多表 Word：结合各表上方说明与每表列名生成默认抽取指令。"""
+    lines = [
+        "从源文档中抽取表格数据；模板含多个 Word 表格，请同时遵守「各表上方说明」与「各表列名（表头）」。"
+    ]
+    for i, spec in enumerate(table_specs):
+        if not isinstance(spec, dict):
+            continue
+        idx = int(spec.get("table_index", i))
+        above = (spec.get("instruction_above") or "").strip()
+        cols = spec.get("field_names") or []
+        col_s = "、".join(cols[:24]) if cols else ""
+        if above:
+            lines.append(f"表格{idx + 1} — 表上方说明：{above[:800]}")
+        if col_s:
+            lines.append(f"表格{idx + 1} — 该表应填列名：{col_s}")
+    tail = "、".join(resolved[:24]) if resolved else "各字段"
+    lines.append(
+        f"输出 records 的字段名为以上各表列名的并集，包含：{tail}；仅适用于某张表的列在其它表对应的记录中可留空。"
+    )
+    return "\n".join(lines)
 
 
 def _rel_path(path: str) -> str:

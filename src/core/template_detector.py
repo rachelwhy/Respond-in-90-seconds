@@ -1,6 +1,58 @@
 from pathlib import Path
+from typing import List
+
 from openpyxl import load_workbook
 from docx import Document
+from docx.oxml.ns import qn
+from docx.table import Table as DocxTable
+from docx.text.paragraph import Paragraph
+
+
+def _iter_body_blocks(doc: Document):
+    """按文档顺序遍历正文中的段落与表格（与 doc.tables 顺序一致）。"""
+    body = doc.element.body
+    for child in body.iterchildren():
+        if child.tag == qn("w:p"):
+            yield Paragraph(child, doc)
+        elif child.tag == qn("w:tbl"):
+            yield DocxTable(child, doc)
+
+
+def _paragraphs_text_before_each_table(doc: Document) -> List[str]:
+    """每个表格之前累积的段落文本（表与表之间的说明文字）。"""
+    current: List[str] = []
+    before: List[str] = []
+    for block in _iter_body_blocks(doc):
+        if isinstance(block, Paragraph):
+            t = (block.text or "").strip()
+            if t:
+                current.append(t)
+        else:
+            before.append("\n".join(current))
+            current = []
+    return before
+
+
+def _header_row_fields(table: DocxTable) -> List[str]:
+    if len(table.rows) < 1:
+        return []
+    header_fields = []
+    for cell in table.rows[0].cells:
+        text = (cell.text or "").strip()
+        if text:
+            header_fields.append(text)
+    return header_fields
+
+
+def _merge_unique_field_names(per_table: List[List[str]]) -> List[str]:
+    seen = set()
+    out: List[str] = []
+    for row in per_table:
+        for name in row:
+            if name not in seen:
+                seen.add(name)
+                out.append(name)
+    return out
 
 
 def detect_template_structure(template_path: str, multi_table: bool = False) -> dict:
@@ -17,7 +69,7 @@ def detect_template_structure(template_path: str, multi_table: bool = False) -> 
     if ext in [".xlsx", ".xlsm"]:
         return detect_excel_structure(template_path)
     if ext == ".docx":
-        return detect_word_structure(template_path, multi_table)
+        return detect_word_structure(template_path, multi_table=multi_table)
     raise ValueError(f"暂不支持的模板类型：{ext}")
 
 
@@ -60,8 +112,69 @@ def detect_excel_structure(template_path: str) -> dict:
 
 
 def detect_word_structure(template_path: str, multi_table: bool = False) -> dict:
-    """检测Word模板结构"""
+    """检测 Word 模板结构。
+
+    - 单个表格：template_mode=word_table，取首行表头。
+    - 多个表格：template_mode=word_multi_table，为每个表记录首行表头及表上方连续段落文字（填表说明）。
+
+    Args:
+        multi_table: 保留参数（与 Excel 多表等 API 对齐）；当前以 ``len(doc.tables) > 1`` 自动启用多表检测。
+    """
+    _ = multi_table
+    doc = Document(template_path)
+    if not doc.tables:
+        raise ValueError("Word 模板中没有表格，暂不支持自动识别纯正文模板")
+    if len(doc.tables) > 1:
+        return _detect_multi_word_table(template_path)
     return _detect_single_word_table(template_path)
+
+
+def _detect_multi_word_table(template_path: str) -> dict:
+    """多表 Word：每表第一行为列名；表与上一表之间的段落合并为 instruction_above。"""
+    doc = Document(template_path)
+    if not doc.tables:
+        raise ValueError("Word 模板中没有表格")
+    before_texts = _paragraphs_text_before_each_table(doc)
+    if len(before_texts) != len(doc.tables):
+        # 与 doc.tables 一一对应；异常时回退为等长空串
+        while len(before_texts) < len(doc.tables):
+            before_texts.append("")
+        before_texts = before_texts[: len(doc.tables)]
+
+    table_specs = []
+    per_table_fields: List[List[str]] = []
+    for i, table in enumerate(doc.tables):
+        fields_i = _header_row_fields(table)
+        if len(fields_i) < 1:
+            raise ValueError(f"第 {i + 1} 个 Word 表格无法识别表头（首行无有效列名）")
+        per_table_fields.append(fields_i)
+        above = (before_texts[i] or "").strip()
+        spec = {
+            "table_index": i,
+            "field_names": fields_i,
+            "instruction_above": above,
+            # 模板预留数据行容量（不含表头），用于控制填表超量。
+            "max_rows": max(0, len(table.rows) - 1),
+        }
+        if above:
+            first_line = above.split("\n", 1)[0].strip()
+            if first_line:
+                spec["description"] = first_line[:120]
+        table_specs.append(spec)
+
+    union_fields = _merge_unique_field_names(per_table_fields)
+    if len(union_fields) < 1:
+        raise ValueError("多表 Word 模板未识别到任何列名")
+
+    return {
+        "task_mode": "table_records",
+        "template_mode": "word_multi_table",
+        "table_index": 0,
+        "header_row": 0,
+        "start_row": 1,
+        "field_names": union_fields,
+        "table_specs": table_specs,
+    }
 
 
 def _detect_single_word_table(template_path: str) -> dict:

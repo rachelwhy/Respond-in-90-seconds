@@ -227,6 +227,9 @@ def fill_word_table(template_path: str, output_path: str, records, table_index: 
             if idx >= len(doc.tables):
                 continue
             group_records = group.get('records', [])
+            # 无记录时不写入、不清空数据行，避免把整张表刷成空白
+            if not group_records:
+                continue
             # 如果records是字符串，尝试解析为JSON
             if isinstance(group_records, str):
                 try:

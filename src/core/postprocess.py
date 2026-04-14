@@ -2,10 +2,13 @@ import json
 import re
 import os
 import logging
+from collections import Counter
 from decimal import Decimal, ROUND_HALF_UP
 from pathlib import Path
+from typing import Any, Dict, List
 
 from src.adapters.model_client import call_model, call_ollama
+from src.core.field_interpreter import FieldInterpreter
 
 logger = logging.getLogger(__name__)
 
@@ -16,6 +19,80 @@ def _is_debug_enabled() -> bool:
 
 
 _DEBUG = _is_debug_enabled()
+_FIELD_INTERPRETER = FieldInterpreter()
+
+
+def _semantic_numeric_resolve(
+    raw_value: Any,
+    field_name: str,
+    field_type: str,
+    aliases: List[str],
+    record: Dict[str, Any],
+    fields: List[dict],
+    source_text: str,
+) -> Any:
+    """兼容旧函数名：委托到通用字段解释层。"""
+    return _FIELD_INTERPRETER.resolve(
+        raw_value=raw_value,
+        field_name=field_name,
+        field_type=field_type,
+        aliases=aliases,
+        record=record,
+        fields=fields,
+        source_text=source_text,
+    )
+
+
+def _auto_backfill_sparse_text_fields(records: List[Dict[str, Any]], profile: dict) -> List[str]:
+    """对高一致性的文本列做保守回填（例如整表大洲均为 Asia）。"""
+    if not records:
+        return []
+
+    fields = profile.get("fields") or []
+    field_type_map: Dict[str, str] = {}
+    for f in fields:
+        if isinstance(f, dict) and f.get("name"):
+            field_type_map[str(f["name"])] = str(f.get("type") or "").lower()
+
+    def _is_text_like(col: str) -> bool:
+        t = field_type_map.get(col, "")
+        if t in {"number", "numeric", "money", "percentage", "date", "datetime", "time"}:
+            return False
+        return True
+
+    changed_cols: List[str] = []
+    row_count = len(records)
+    if row_count < 4:
+        return changed_cols
+
+    columns = [k for k in records[0].keys() if isinstance(k, str)]
+    for col in columns:
+        if not _is_text_like(col):
+            continue
+
+        non_empty_values = []
+        blank_rows = []
+        for idx, rec in enumerate(records):
+            v = str(rec.get(col, "")).strip()
+            if v:
+                non_empty_values.append(v)
+            else:
+                blank_rows.append(idx)
+
+        if not non_empty_values or not blank_rows:
+            continue
+
+        non_empty_ratio = len(non_empty_values) / row_count
+        top_value, top_count = Counter(non_empty_values).most_common(1)[0]
+        dominance = top_count / len(non_empty_values)
+
+        # 仅在高一致性列执行回填，降低误填风险。
+        if non_empty_ratio >= 0.4 and dominance >= 0.85:
+            for idx in blank_rows:
+                records[idx][col] = top_value
+            changed_cols.append(col)
+
+    return changed_cols
 
 
 def build_missing_fields_prompt(text, missing_fields, profile):
@@ -43,7 +120,7 @@ def _build_annotation_re():
             return re.compile(rf'[（(]\s*(?:{joined})\s*[）)]')
     except Exception:
         pass
-    # 兜底：空模式（不做任何替换）
+    # 回退为空匹配模式，不替换任何内容。
     return re.compile(r'(?!)')
 
 _LLM_ANNOTATION_RE = _build_annotation_re()
@@ -80,7 +157,7 @@ def clean_org_name(value: str) -> str:
         if m:
             return m.group(1).strip()
 
-    # 2) 再做兜底：从句子中找“最像公司名的后缀实体”，取“最后一个”更稳
+    # 2) 回退到后缀实体提取，优先返回句尾位置的组织名
     suffix = r'(?:信息技术有限公司|科技有限公司|数据服务有限公司|智能设备有限公司|网络科技有限公司|软件有限公司|有限公司|集团|研究院|中心|学院|大学)'
     m_all = re.findall(r'([^\s，。、“”"（）()]{2,60}?%s)' % suffix, s)
     if m_all:
@@ -117,6 +194,29 @@ def normalize_money(value: str) -> str:
     s = str(value).replace(",", "").strip()
     m = re.search(r"\d+(?:\.\d+)?", s)
     return m.group(0) if m else ""
+
+
+def _clean_numeric_like_value(value: Any, field_type: str) -> Any:
+    """对数值类字段做通用去单位清洗，尽量保留纯数字。"""
+    ftype = str(field_type or "").lower()
+    if value is None:
+        return value
+    s = str(value).strip()
+    if not s:
+        return s
+
+    # 对“纯数字+短单位”的显式模式做保守清洗（即使字段类型被误标为 text）。
+    obvious = re.match(r"^\s*([-+]?\d+(?:\.\d+)?)\s*[^\d\s]{1,8}\s*$", s)
+    if obvious:
+        return obvious.group(1)
+
+    if ftype not in {"number", "numeric", "money", "percentage"}:
+        return value
+    s = s.replace(",", "")
+    m = re.search(r"[-+]?\d+(?:\.\d+)?", s)
+    if not m:
+        return value
+    return m.group(0)
 
 
 def normalize_internal(value: str, field_type: str, field_name: str = "") -> str:
@@ -214,7 +314,7 @@ def rule_fill_table_records(extracted_raw: dict, profile: dict):
         if not isinstance(record, dict):
             continue
 
-        # 1. 先把不存在的字段补成空字符串，避免后面 KeyError
+        # 1. 统一补齐缺失字段，确保后续处理可直接按字段访问
         for name in field_names:
             if name not in record:
                 record[name] = ""
@@ -521,6 +621,7 @@ def build_debug_result(extracted_raw: dict, profile: dict) -> dict:
         if name == "甲方单位":
             raw_value = clean_org_name(raw_value)
 
+        raw_value = _clean_numeric_like_value(raw_value, field_type)
         internal_value = normalize_internal(raw_value, field_type, field_name=name)
         final_value = format_value(internal_value, field_type, output_format)
         status = "ok" if str(final_value).strip() else "empty"
@@ -567,6 +668,42 @@ def _strip_value_unit(value: str, unit: str) -> str:
     if re.match(r'^-?[\d,]+(\.\d+)?$', cleaned):
         return cleaned
     return value
+
+
+def _clean_series_repr_value(field_name: str, raw_value):
+    """清理 pandas Series 字符串化残留，提取真实单元格值。"""
+    if raw_value is None:
+        return raw_value
+    if not isinstance(raw_value, str):
+        return raw_value
+
+    s = raw_value.strip()
+    if not s:
+        return s
+    # 仅在符合 Series 字符串特征时执行清洗，避免影响正常文本。
+    if not re.search(r"\nName:\s*\d+\s*(?:,|$)", s):
+        return raw_value
+    if not re.search(r"\bdtype:\s*[A-Za-z0-9_]+", s):
+        return raw_value
+
+    lines = [ln.strip() for ln in s.splitlines() if ln.strip()]
+    body = [ln for ln in lines if not ln.startswith("Name:") and "dtype:" not in ln]
+    if not body:
+        return raw_value
+
+    fname = str(field_name or "").strip()
+    for ln in reversed(body):
+        if fname and fname in ln:
+            tail = ln.split(fname, 1)[1].strip()
+            if tail:
+                return tail
+
+    for ln in reversed(body):
+        parts = [p.strip() for p in re.split(r"\s{2,}|\t+", ln) if p.strip()]
+        if len(parts) >= 2:
+            return parts[-1]
+
+    return body[-1]
 
 
 _DEDUP_UNIT_RE = re.compile(r'\s*(亿元|万元|千元|百元|元|亿|万|千|百|%|％|‰|万人|千人|人|平方公里|km²|亿美元|万美元|美元)\s*$')
@@ -705,7 +842,7 @@ def _flatten_nested_records(raw_records: list, field_names: list) -> list:
 def process_table_records(extracted_raw: dict, profile: dict) -> dict:
     fields = profile.get("fields", [])
 
-    # 兼容多种输入格式
+    # 兼容列表和字典两类输入载荷
     if isinstance(extracted_raw, list):
         raw_records = extracted_raw  # extracted_raw 本身就是记录列表
     elif isinstance(extracted_raw, dict):
@@ -716,7 +853,7 @@ def process_table_records(extracted_raw: dict, profile: dict) -> dict:
     if not isinstance(raw_records, list):
         raw_records = []
 
-    # 调试信息
+    # 记录输入规模与字段信息（仅调试模式）
     if _DEBUG:
         logger.debug("process_table_records: 输入记录数=%s, 字段数=%s", len(raw_records), len(fields))
     if raw_records and len(raw_records) > 0:
@@ -736,6 +873,7 @@ def process_table_records(extracted_raw: dict, profile: dict) -> dict:
 
     # 规范化字段名：将每条记录中的字段名映射到模板规范字段名
     reverse_alias_map = {}
+    alias_map = {}
     try:
         from src.core.alias import load_alias_map, build_reverse_alias_map
         alias_map = load_alias_map()
@@ -760,8 +898,36 @@ def process_table_records(extracted_raw: dict, profile: dict) -> dict:
     except Exception as e:
         logger.warning("表格字段名规范化失败: %s", e)
 
+    def _infer_numeric_like_fields(records: List[dict]) -> set[str]:
+        numeric_types = {"number", "numeric", "money", "percentage"}
+        inferred: set[str] = set()
+        for item in fields:
+            name = item["name"]
+            ftype = str(item.get("type", "")).lower()
+            if ftype in numeric_types:
+                inferred.add(name)
+                continue
+            vals = []
+            for rec in records:
+                if not isinstance(rec, dict):
+                    continue
+                v = str(rec.get(name, "")).strip()
+                if v:
+                    vals.append(v)
+            if len(vals) < 3:
+                continue
+            obvious = sum(
+                1 for v in vals if re.match(r"^\s*[-+]?\d+(?:\.\d+)?(?:\s*[^\d\s]{1,8})?\s*$", v)
+            )
+            if obvious / max(1, len(vals)) >= 0.7:
+                inferred.add(name)
+        return inferred
+
+    inferred_numeric_fields = _infer_numeric_like_fields(raw_records)
+
     def _format_rows(records):
         final_records = []
+        source_text = extracted_raw.get("_source_text", "") if isinstance(extracted_raw, dict) else ""
         for record in records:
             if not isinstance(record, dict):
                 continue
@@ -772,6 +938,7 @@ def process_table_records(extracted_raw: dict, profile: dict) -> dict:
                 output_format = item.get("output_format", "plain")
                 unit = item.get("unit", "")
                 raw_value = record.get(name, "")
+                raw_value = _clean_series_repr_value(name, raw_value)
 
                 # 如果直接获取为空，尝试通过别名映射查找
                 if raw_value == "":
@@ -783,19 +950,31 @@ def process_table_records(extracted_raw: dict, profile: dict) -> dict:
                         # 如果键通过别名映射到当前字段名
                         normalized_key = reverse_alias_map.get(key, key)
                         if normalized_key == name:
-                            raw_value = value
+                            raw_value = _clean_series_repr_value(name, value)
                             break
 
                 # 如果仍然为空，尝试子串匹配：检查记录中的键是否包含字段名，或字段名包含键
                 if raw_value == "":
                     for key, value in record.items():
                         if name in key or key in name:
-                            raw_value = value
+                            raw_value = _clean_series_repr_value(name, value)
                             break
+
+                raw_value = _semantic_numeric_resolve(
+                    raw_value=raw_value,
+                    field_name=name,
+                    field_type=field_type,
+                    aliases=alias_map.get(name, []) if isinstance(alias_map, dict) else [],
+                    record=record,
+                    fields=fields,
+                    source_text=source_text,
+                )
 
                 # 若字段名带单位（如 人均GDP（元））则先剥离值中的单位后缀
                 if unit:
                     raw_value = _strip_value_unit(str(raw_value), unit)
+                clean_type = "number" if name in inferred_numeric_fields else field_type
+                raw_value = _clean_numeric_like_value(raw_value, clean_type)
                 internal_value = normalize_internal(raw_value, field_type, field_name=name)
                 final_value = format_value(internal_value, field_type, output_format)
                 row[name] = final_value
@@ -804,8 +983,8 @@ def process_table_records(extracted_raw: dict, profile: dict) -> dict:
 
     result = {"records": _format_rows(raw_records)}
 
-    # 规范化去重（处理切片重叠导致的重复记录）
-    if result["records"]:
+    # 规范化去重（处理切片重叠导致的重复记录）；多表并行抽取结果不去重以免误合并不同表
+    if result["records"] and not extracted_raw.get("_word_multi_parallel"):
         deduped, removed = _dedup_records(result["records"])
         if removed:
             if _DEBUG:
@@ -887,6 +1066,24 @@ def process_by_profile(extracted_raw: dict, profile: dict):
         result = process_table_records(extracted_raw, profile)
     else:
         result = process_single_record(extracted_raw, profile)
+
+    # 在统一入口执行指令日期过滤，保证 API/CLI 行为一致。
+    try:
+        from src.core.instruction_filters import filter_records_by_instruction_date_range
+        filtered, removed, date_field = filter_records_by_instruction_date_range(
+            result, profile.get("instruction", "")
+        )
+        if removed and _DEBUG:
+            logger.info("指令日期范围过滤已应用（字段=%s，移除=%s）", date_field, removed)
+        result = filtered
+    except Exception:
+        pass
+
+    if isinstance(result, dict) and isinstance(result.get("records"), list):
+        backfilled_cols = _auto_backfill_sparse_text_fields(result["records"], profile)
+        if backfilled_cols:
+            result.setdefault("metadata", {})
+            result["metadata"]["auto_backfilled_fields"] = backfilled_cols
 
     # 保持“原文阅读顺序”的稳定排序（当可从原文定位到记录实体时）
     # 约定：调用方可传入 extracted_raw["_source_text"]（Docling 输出的阅读顺序文本）

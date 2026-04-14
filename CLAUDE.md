@@ -7,6 +7,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## 项目概述
 企业内网AI文档处理系统，支持模板填表和文档问答。采用混合策略（规则预抽取+AI模型验证）实现文档结构化提取。
 
+**上线形态**：以 **`api_server`（FastAPI）** 与 `src/api/*` 为生产主路径；`main.py` 与 `scripts/` 用于调试、批测与异步任务子进程。抽取路由摘要见 `src/core/extraction_routing.py`（返回 `metadata.pipeline_routing`），详见 `docs/DEPLOYMENT.md`。
+
 ## 技术栈
 - Python 3.11+, FastAPI, Ollama
 - **主要依赖**：openpyxl, python-docx, requests, rapidfuzz, openai, python-dotenv
@@ -77,8 +79,8 @@ python main.py \
 # 纯规则抽取模式
 python main.py --llm-mode off ...
 
-# 补充抽取模式（规则预抽取 + AI补充缺失字段）
-python main.py --llm-mode supplement ...
+# 兼容模式（supplement 会映射为 full）
+python main.py --llm-mode supplement ... # 等价于 full
 
 # 完整AI抽取模式（默认，Docling语义分块 + LLM）
 python main.py --llm-mode full ...
@@ -88,8 +90,8 @@ python test_deepseek_connection.py
 
 # 新架构参数说明
 # LLM抽取模式
-python main.py --llm-mode full ...      # 始终全文抽取（默认）
-python main.py --llm-mode supplement ... # 仅补充缺失字段
+python main.py --llm-mode full ...      # 默认模型抽取
+python main.py --llm-mode supplement ... # 兼容别名，等价于 full
 python main.py --llm-mode off ...       # 仅规则抽取（替代旧的--use-rules-only）
 
 # 超时控制
@@ -117,9 +119,10 @@ python scripts/run_batch.py \
   --collect-metrics \
   --output-report test/reports/benchmark_report.json
 
-# 运行单个测试
-python -m pytest tests/test_unit_recognizer.py -v
-python -m pytest tests/test_integration.py -v
+# 运行单文件测试示例（当前仓库保留的用例）
+python -m pytest tests/test_extraction_routing.py -v
+# 运行全部保留的 tests（不含已移除的陈旧集成/单元用例）
+python -m pytest tests/ -q
 ```
 
 ### 模板管理
@@ -160,30 +163,29 @@ A23_ENABLE_OCR=false
 ## 高层架构
 
 ### 系统层次
-1. **应用层**: `main.py`（命令行）、`api_server.py`（HTTP API）、`src/api/qna_service.py`（文档问答服务，含LangChain可选集成）、批处理脚本
-2. **算法接口层**:
-   - `src/algorithm/` - 统一算法接口，与后端业务逻辑解耦
-   - `src/algorithm/interface.py` - 简化算法接口（本地调用）
-   - `src/algorithm/service.py` - 完整算法服务（支持缓存、并发、资源池）
-3. **业务逻辑层**:
-   - `src/pipeline/` - 流程编排器
-   - `src/extractors/` - 字段抽取器（单位识别、文本分割等）
-   - `src/auto_profile/` - 模板检测与自动profile生成
-   - `src/core/field_normalizer.py` - 通用字段归一化框架（基于JSON规则配置）
-4. **引擎层**:
-   - `src/engine/model_client.py` - 统一模型调用接口（Ollama/OpenAI/Qwen/DeepSeek）
-   - `src/engine/document_reader.py` - 文档读取与预处理
-   - `src/engine/writers.py` - 模板写回器（Excel/Word/JSON）
-   - `src/engine/retrieval_client.py` - 检索增强生成
-5. **解析器层**: `src/parsers/` - 多格式文档解析（Excel/Word/Markdown/文本/PDF/图像）
-   - `src/adapters/docling_adapter.py` - Docling解析器（支持语义分块、合并单元格处理）
-6. **基础设施层**:
-   - `src/knowledge/` - 领域知识库（字段别名、城市词典、字段归一化规则等）
-   - `src/config.py` - 集中配置管理
-   - `src/auth/` - JWT认证系统
-   - `src/ocr/` - 多引擎OCR支持
-   - `src/runtime_config.py` - 运行时配置管理
-   - `src/knowledge/field_normalization_rules.json` - 字段归一化规则配置文件
+1. **应用入口层**:
+   - `api_server.py` - FastAPI HTTP 服务（生产主入口）
+   - `main.py` - CLI / 批测 / 异步任务子进程入口
+2. **API 编排层**:
+   - `src/api/direct_extractor.py` - 同步抽取编排
+   - `src/api/task_manager.py` - 异步任务管理与子进程执行
+   - `src/api/qna_service.py` - 文档问答服务
+3. **核心抽取层（src/core）**:
+   - `extraction_service.py` - 抽取主链路（切片、模型调用、合并）
+   - `extraction_routing.py` - 抽取路由元数据（`pipeline_routing`）
+   - `reader.py` - 输入聚合与语义分块
+   - `profile.py` / `template_detector.py` - 模板识别与 profile 生成
+   - `postprocess.py` / `field_interpreter.py` - 字段清洗、解释与后处理
+   - `writers.py` - Excel/Word/JSON 写回
+4. **适配层（src/adapters）**:
+   - `model_client.py` - 模型后端统一调用（Ollama/OpenAI/Qwen/DeepSeek）
+   - `docling_adapter.py` - Docling 解析与语义块
+   - `langextract_adapter.py` - LangExtract 结构化抽取适配
+   - `parser_factory.py` / `text_parser.py` - 多格式解析入口
+5. **基础设施层**:
+   - `src/config.py` - 集中配置与环境变量读取
+   - `src/knowledge/` - 领域知识与归一化规则
+   - `storage/` - 任务、上传、临时导出存储目录
 
 ### 核心流程：模板填表
 ```
@@ -206,7 +208,6 @@ A23_ENABLE_OCR=false
 ### 关键配置文件
 - `.env` - 环境变量（API密钥、模型类型、OCR配置、字段别名阈值、归一化规则路径）
 - `src/config.py` - 应用配置（超时、权重、开关）
-- `src/algorithm/service.py` - 算法配置（AlgorithmConfig类，控制缓存、并发、资源池）
 - `src/knowledge/*.json` - 领域知识库（字段别名、城市词典、字段归一化规则等）
   - `field_aliases.json` - 字段别名映射
   - `field_normalization_rules.json` - 字段归一化规则配置（新）
@@ -236,7 +237,7 @@ A23_ENABLE_OCR=false
 ### 4. 参数体系优化
 - **`--llm-mode`参数**: 替代旧的`--use-rules-only`和`--use-unit-aware`
   - `full`: 始终全文抽取（默认）
-  - `supplement`: 仅补充缺失字段  
+  - `supplement`: 兼容别名（内部映射为 `full`）
   - `off`: 仅规则抽取
 - **`--max-chunks`**: 控制语义分块处理数量
 - **`--quiet`**: 安静模式，禁用控制台进度输出
@@ -262,8 +263,8 @@ A23_ENABLE_OCR=false
 7. 保持向后兼容性：新增功能不应破坏现有模板填表流程
 
 ## AI可以做的事
-- 添加新的文档解析器（遵循 `src/parsers/base.py` 接口）
-- 优化字段抽取逻辑（更新 `src/extractors/` 中的规则库）
+- 添加新的文档解析适配（遵循 `src/adapters/parser_factory.py` 约定）
+- 优化字段抽取逻辑（以 `src/core/extraction_service.py`、`src/core/postprocess.py` 为主）
 - 扩展字段归一化规则（更新 `src/knowledge/field_normalization_rules.json` 配置文件）
 - 配置字段别名匹配阈值（通过 `A23_FUZZY_THRESHOLD` 环境变量）
 - 使用Docling语义分块进行文档结构分析
@@ -302,7 +303,8 @@ A23_ENABLE_OCR=false
 - `test/reports/` - 验证报告和性能指标
 
 ## 文档与仓库结构（当前）
-- 权威模块目录：`src/adapters/`、`src/api/`、`src/core/`、`src/knowledge/`（根目录下 **无** 独立的 `src/algorithm`、`src/pipeline`、`src/engine`、`src/parsers` 等旧路径）。
+- 权威模块目录：`src/adapters/`、`src/api/`、`src/core/`（含 `extraction_routing.py`）、`src/knowledge/`（根目录下 **无** 独立的 `src/algorithm`、`src/pipeline`、`src/engine`、`src/parsers` 等旧路径）。
 - 架构与流程详解：[A23_TECHNICAL_FLOW.md](A23_TECHNICAL_FLOW.md)
 - HTTP 接口说明：[HTTP_API_USAGE.md](HTTP_API_USAGE.md)
-- **非功能性**优化探索与文档勘误：[PROJECT_OPTIMIZATION_REPORT_2026.md](PROJECT_OPTIMIZATION_REPORT_2026.md)
+- 部署与路由说明：[docs/DEPLOYMENT.md](docs/DEPLOYMENT.md)
+- 文档索引：[docs/README.md](docs/README.md)

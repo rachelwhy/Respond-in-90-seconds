@@ -16,10 +16,14 @@
 
 import json
 import logging
+import os
+import re
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import List, Dict, Any, Optional, Tuple
 from pathlib import Path
 from src.core.interfaces import IExtractionService
+from src.core.llm_mode import normalize_llm_mode
 
 # 导入必要的模块
 try:
@@ -50,6 +54,36 @@ class CoreExtractionService(IExtractionService):
         pass
 
     # ===== 从main.py提取的核心函数 =====
+
+    @staticmethod
+    def _build_runtime_constraints(text: str, field_names: List[str], task_mode: str) -> str:
+        """构建通用运行时约束，不改变用户原始指令。"""
+        if task_mode != "table_records":
+            return ""
+        if not field_names:
+            return ""
+        primary_field = str(field_names[0]).strip() if field_names else ""
+        sample_hint = ""
+        # 仅做轻量文档信号判断：是否存在“分段/分条”结构。
+        if text:
+            has_segment_like = bool(
+                ("。" in text and len(text) > 200)
+                or re.search(r"(?:^|\n)\s*\d+[\.、)]\s*", text)
+            )
+            if has_segment_like:
+                sample_hint = "文档包含多段/多条实体描述，请逐段绑定字段值。"
+
+        lines = [
+            "【运行时约束（系统自动注入，不替代用户指令）】",
+            "A. 原文锚定：字段值必须来自与该记录同一局部片段，不跨段拼接。",
+            "B. 粒度守恒：优先采用局部片段中最具体实体，不得上卷为更高层汇总实体。",
+            "C. 就近绑定：当同段出现多个实体时，取与关键数值最近的实体。",
+            "D. 禁止概括：不得把多条不同实体统一写成同一抽象标签。",
+            f"E. 主标识字段「{primary_field}」必须能区分记录主体，避免全表同值。",
+        ]
+        if sample_hint:
+            lines.append(f"F. {sample_hint}")
+        return "\n".join(lines)
 
     def build_smart_prompt(self, text: str, profile: dict) -> str:
         """根据profile和文本构建抽取prompt（从main.py复制）"""
@@ -84,16 +118,54 @@ class CoreExtractionService(IExtractionService):
         except Exception:
             pass
 
+        runtime_constraints = self._build_runtime_constraints(text, field_names, task_mode)
+
         # ——— 多表格Word模式 ———
         if template_mode == "word_multi_table":
             table_specs = profile.get("table_specs", [])
-            required_groups = [(s.get('filter_field', ''), s.get('filter_value', '')) for s in table_specs]
+            required_groups = []
+            for s in table_specs:
+                if not isinstance(s, dict):
+                    continue
+                ff = (s.get("filter_field") or "").strip()
+                fv = (s.get("filter_value", "") or "")
+                if ff and str(fv).strip():
+                    required_groups.append((ff, fv))
             tables_info = ""
             if table_specs:
-                tables_info = "\n模板中的表格分配规则：\n" + "\n".join([
-                    f"  表格{s.get('table_index', i)+1}：{s.get('filter_field', '字段')}={s.get('filter_value', '?')}（{s.get('description', '')}）"
-                    for i, s in enumerate(table_specs)
-                ])
+                parts = []
+                for i, s in enumerate(table_specs):
+                    if not isinstance(s, dict):
+                        continue
+                    idx = int(s.get("table_index", i))
+                    above = (s.get("instruction_above") or "").strip()
+                    desc = (s.get("description") or "").strip()
+                    tcols = s.get("field_names") or []
+                    col_line = "、".join(tcols[:32]) if tcols else "（列名见全局字段列表）"
+                    lines = [f"  ——— 表格 {idx + 1}（第 {idx + 1} 个子 profile）———"]
+                    bp = (s.get("builtin_prompt") or "").strip()
+                    if bp:
+                        lines.append("  【该表内置抽取提示 builtin_prompt】")
+                        for ln in bp.split("\n"):
+                            lines.append(f"  {ln}")
+                    tp = s.get("table_profile")
+                    if isinstance(tp, dict) and tp.get("fields"):
+                        lines.append("  【该表子 profile · fields】")
+                        lines.append("  " + json.dumps(tp["fields"], ensure_ascii=False))
+                    if above:
+                        lines.append(f"  表上方说明（填表规则/范围）：{above}")
+                    if desc and desc not in (above or ""):
+                        lines.append(f"  摘要：{desc}")
+                    lines.append(f"  该表表头列名：{col_line}")
+                    ff, fv = s.get("filter_field", ""), s.get("filter_value", "")
+                    if ff and str(fv).strip():
+                        lines.append(f"  记录分组标识：字段「{ff}」=「{fv}」的行写入该表")
+                    parts.append("\n".join(lines))
+                tables_info = (
+                    "\n模板中多表规则（每个表对应一段 builtin_prompt + 一个 table_profile；"
+                    "若有分组字段则按标识拆分记录）：\n"
+                    + "\n".join(parts)
+                )
             required_groups_str = ""
             if required_groups:
                 required_groups_str = "\n\n必须包含的分组（每个分组至少要有一条记录）：\n" + "\n".join([
@@ -102,20 +174,22 @@ class CoreExtractionService(IExtractionService):
 
             field_descs = [f'{fn}（别名：{", ".join(field_aliases_info[fn])}）' if fn in field_aliases_info else fn for fn in field_names]
             example_records = [{fn: f"示例{fn}{i+1}" for fn in field_names} for i in range(3)]
-            return f"""你是一个严格的信息抽取助手。请从文档中提取所有分组记录并按JSON格式输出。
+            return f"""你是一个严格的信息抽取助手。请从文档中提取记录并按JSON格式输出。
 
-用户指令：{instruction}
+【总任务说明】（外部入口指令 / 整体任务，优先于下方各表局部规则）
+{instruction}
 {tables_info}{required_groups_str}
 
-必须提取的字段（字段名必须精确匹配）：
+必须提取的字段（字段名必须精确匹配；为各表列名的并集）：
 {json.dumps(field_descs, ensure_ascii=False, indent=2)}
 
 重要要求：
-1. 模板有多个表格，每个表格对应不同的分组（如不同城市）
-2. 请提取文档中所有分组的所有记录，不要遗漏任何一组
-3. 每条记录都必须包含所有指定字段，缺失字段用空字符串""
-4. 字段值直接从文档获取，保持原始格式
-5. 若文档中找不到某分组数据，仍需为该分组输出记录（分组名填入对应字段，其余留空）
+1. 模板含多个 Word 表格时，请结合「各表上方说明」理解每张表应填的数据范围与规则
+2. 若 profile 中配置了 filter_field / filter_value，则不同表格对应不同分组（如不同城市），请提取所有分组
+3. 每条记录须包含上述全部字段键；不适用的列用空字符串""
+4. 字段值从文档直接获取，保持原始格式
+5. 若配置了分组且文档中缺某分组，仍需为该分组输出占位记录
+{runtime_constraints}
 
 输出格式示例：
 {json.dumps({"records": example_records}, ensure_ascii=False, indent=2)}
@@ -145,6 +219,8 @@ class CoreExtractionService(IExtractionService):
 5. 文档字符数约为 {len(text)} 字，预估记录数约为 {estimated_count} 条，请参考该数量。
 6. 每条记录应包含所有指定字段，找不到的字段使用空字符串""。
 7. 字段值应直接从文档中获取，保持原始格式。
+8. 需遵守下列系统运行时约束，不改变用户目标但约束字段映射粒度：
+{runtime_constraints}
 
 输出格式（必须包含"records"键）：
 {json.dumps({"records": example_records}, ensure_ascii=False, indent=2)}
@@ -178,7 +254,155 @@ class CoreExtractionService(IExtractionService):
 
 现在开始抽取，只输出JSON："""
 
-    def extract_with_slicing(self, text: str, profile: dict, use_model: bool = True, slice_size: int = 2000, overlap: int = 100, show_progress: bool = True, time_budget: int = 110, chunks: list = None, max_chunks: int = 50, logger=None):
+    def build_smart_prompt_word_table(self, text: str, profile: dict, table_spec: dict) -> str:
+        """方案 B：总任务说明（外部入口 instruction）在前；本表模板元信息在中；源文档片段含表内原文在后。"""
+        tp = table_spec.get("table_profile") or {}
+        fields = tp.get("fields")
+        if not fields:
+            fields = [f for f in profile.get("fields", []) if isinstance(f, dict)]
+        idx = int(table_spec.get("table_index", 0))
+        builtin = (table_spec.get("builtin_prompt") or "").strip()
+        above = (table_spec.get("instruction_above") or "").strip()
+        extra = (tp.get("instruction") or "").strip()
+        master = (profile.get("instruction") or "").strip() or "请根据字段要求从文档中抽取信息。"
+
+        # 总任务 = 用户/API/CLI 最开始写入 profile 的 instruction（不与单表 builtin 混排顺序颠倒）
+        local_parts: List[str] = [
+            f"【第 {idx + 1} 张 Word 模板表 · 抽取要点】",
+            "说明：下列为「模板侧」列名与规则；具体数据见文末「文档内容」（已自动附带源文档中与本表对应的表内原文）。",
+        ]
+        if builtin:
+            local_parts.append(builtin)
+        else:
+            if above:
+                local_parts.append(f"模板表上方说明：\n{above}")
+        if extra:
+            local_parts.append(f"本表字段补充说明：\n{extra[:2000]}")
+        local_combined = "\n\n".join(local_parts)
+
+        combined_instruction = (
+            f"【总任务说明】（整体口径与目标，优先于下方各表局部说明）\n{master[:8000]}\n\n"
+            f"{local_combined}"
+        )
+        mini = {
+            "task_mode": "table_records",
+            "template_mode": "excel_table",
+            "instruction": combined_instruction,
+            "fields": fields,
+        }
+        doc_text = (text or "").strip()
+        if doc_text:
+            doc_text = (
+                "【本表相关源文档片段】（含表内单元格原文；请优先据此抽取；与总任务冲突时以总任务为准）\n\n"
+                + doc_text
+            )
+        return self.build_smart_prompt(doc_text, mini)
+
+    @staticmethod
+    def _word_multi_parallel_enabled(profile: dict) -> bool:
+        """兼容旧调用；逻辑见 extraction_routing.is_word_multi_parallel_enabled。"""
+        from src.core.extraction_routing import is_word_multi_parallel_enabled
+
+        return is_word_multi_parallel_enabled(profile)
+
+    def _extract_word_multi_table_parallel(
+        self,
+        text: str,
+        profile: dict,
+        time_budget: int,
+        word_table_segments: Optional[List[str]],
+        show_progress: bool,
+        logger,
+    ) -> Tuple[dict, dict, dict]:
+        """多表 Word 方案 B：每表独立 prompt，并行调用模型，输出 _table_groups。"""
+        table_specs = profile.get("table_specs") or []
+        n = len(table_specs)
+        if n == 0:
+            return {}, {}, {"mode": "word_multi_parallel_skip", "reason": "no_table_specs"}
+
+        def _log(msg: str):
+            if logger:
+                logger.info(msg)
+            else:
+                logging.getLogger(__name__).info(msg)
+
+        segments = word_table_segments or []
+        while len(segments) < n:
+            segments.append(text)
+        segments = segments[:n]
+
+        start_time = time.perf_counter()
+        per_budget = max(15, int(time_budget / max(1, n) * 0.85))
+
+        def _run_one(i: int) -> Tuple[int, Any]:
+            spec = table_specs[i]
+            seg = segments[i] if i < len(segments) else text
+            if len(seg) > 24000:
+                seg = seg[:24000]
+            prompt = self.build_smart_prompt_word_table(seg, profile, spec)
+            from src.adapters.model_client import call_model
+            deadline = time.time() + min(120, per_budget)
+            raw = call_model(prompt, total_deadline=deadline)
+            return i, raw
+
+        results: Dict[int, Any] = {}
+        max_workers = min(8, n)
+        with ThreadPoolExecutor(max_workers=max_workers) as ex:
+            futures = {ex.submit(_run_one, i): i for i in range(n)}
+            for fut in as_completed(futures):
+                i = futures[fut]
+                try:
+                    idx, raw = fut.result()
+                    results[idx] = raw
+                except Exception as e:
+                    _log(f"[WARN] word_multi_parallel 表 {i + 1} 失败: {e}")
+                    results[i] = {"records": []}
+
+        from src.core.postprocess import _flatten_nested_records
+
+        def _parse_table_records(raw: Any, field_names: List[str]) -> List[dict]:
+            if isinstance(raw, dict) and "records" in raw:
+                recs = raw["records"]
+            elif isinstance(raw, dict) and raw:
+                recs = [raw]
+            else:
+                recs = []
+            if not isinstance(recs, list):
+                return []
+            if field_names:
+                recs = _flatten_nested_records(recs, field_names)
+            return [r for r in recs if isinstance(r, dict)]
+
+        table_groups: List[dict] = []
+        merged_flat: List[dict] = []
+        for i in range(n):
+            spec = table_specs[i]
+            raw = results.get(i, {"records": []})
+            tp = spec.get("table_profile") or {}
+            fnames = [f["name"] for f in tp.get("fields", []) if isinstance(f, dict)]
+            recs = _parse_table_records(raw, fnames)
+            tid = int(spec.get("table_index", i))
+            table_groups.append({"table_index": tid, "records": recs})
+            merged_flat.extend(recs)
+
+        elapsed = time.perf_counter() - start_time
+        _log(f"[INFO] word_multi_parallel 完成：{n} 表，总耗时 {elapsed:.1f}s")
+
+        extracted = {
+            "records": merged_flat,
+            "_table_groups": table_groups,
+            "_word_multi_parallel": True,
+        }
+        meta = {
+            "slicing_enabled": False,
+            "slice_count": n,
+            "mode": "word_multi_parallel",
+            "parallel_workers": max_workers,
+            "elapsed_seconds": round(elapsed, 3),
+        }
+        return extracted, extracted, meta
+
+    def extract_with_slicing(self, text: str, profile: dict, use_model: bool = True, slice_size: int = 2000, overlap: int = 100, show_progress: bool = True, time_budget: int = 110, chunks: list = None, max_chunks: int = 50, logger=None, word_table_segments: Optional[List[str]] = None, routing_bundle: Optional[Dict[str, Any]] = None):
         """使用切片模式进行抽取。优先使用 Docling 语义分块（chunks），回退到字符切片。
         从main.py复制的函数实现
 
@@ -193,6 +417,8 @@ class CoreExtractionService(IExtractionService):
             chunks: Docling 语义分块列表（每个元素含 type 和 text 字段）
             max_chunks: 最多处理的 chunk 数量
             logger: 可选的 Python logger 实例
+            word_table_segments: 多表 Word 时每表一段源文档上下文（与 table_specs 等长）
+            routing_bundle: 与 collect_input_bundle 同结构的 bundle，用于 pipeline_routing（文件类型/能力摘要）
 
         Returns:
             extracted_raw: 抽取结果字典
@@ -209,9 +435,77 @@ class CoreExtractionService(IExtractionService):
                 # 上线默认不向 stdout 打印；统一走 logging
                 logging.getLogger(__name__).info(msg)
 
+        prof_for_routing = profile if isinstance(profile, dict) else {}
+        from src.core.extraction_routing import build_pipeline_routing_meta, is_word_multi_parallel_enabled
+
+        _parallel_word_multi = is_word_multi_parallel_enabled(prof_for_routing)
+        routing_meta = build_pipeline_routing_meta(
+            prof_for_routing,
+            routing_bundle,
+            chunks,
+            max_chunks or 0,
+            parallel_word_multi_enabled=_parallel_word_multi,
+            use_model=use_model,
+        )
+
+        def _with_routing(meta: Optional[dict]) -> dict:
+            md = dict(meta) if meta else {}
+            md["pipeline_routing"] = routing_meta
+            return md
+
         # llm-mode=off：严禁触发任何模型调用（包括 langextract）
         if not use_model:
-            return {}, {}, {"slicing_enabled": False, "slice_count": 0, "mode": "model_disabled"}
+            return {}, {}, _with_routing({"slicing_enabled": False, "slice_count": 0, "mode": "model_disabled"})
+
+        # ── 分支 word_multi_parallel（方案 B）──────────────────────────────────
+        # 与下方「非多表 Word：chunks → LangExtract / 分块 prompt」完全独立，勿合并理解。
+        # chunks 须来自 collect_semantic_chunks_from_bundle（main/direct_extract 已传入）。
+        # 可选子分支 word_multi_langextract_prefill：见 word_multi_langextract_merge 模块文档。
+        if _parallel_word_multi:
+            path_start = time.perf_counter()
+            extracted, model_out, meta = self._extract_word_multi_table_parallel(
+                text, profile, time_budget, word_table_segments, show_progress, logger
+            )
+            meta = dict(meta)
+            meta["word_multi_branch"] = "parallel_only"
+            from src.core.word_multi_langextract_merge import (
+                merge_langextract_into_word_multi_groups,
+                word_multi_langextract_prefill_should_run,
+            )
+
+            lx_run, lx_reason = word_multi_langextract_prefill_should_run(profile, chunks, max_chunks or 0)
+            meta["langextract_prefill_reason"] = lx_reason
+            if lx_run and chunks:
+                text_chunks = [c for c in chunks if c.get("type") != "table"]
+                if max_chunks and len(text_chunks) > max_chunks:
+                    text_chunks = text_chunks[:max_chunks]
+                if text_chunks:
+                    elapsed = time.perf_counter() - path_start
+                    remaining = max(5.0, float(time_budget) - elapsed)
+                    lx_budget = max(5, min(45, int(remaining * 0.85)))
+                    try:
+                        from src.adapters.langextract_adapter import extract_with_langextract
+
+                        lx_records = extract_with_langextract(
+                            text_chunks,
+                            profile,
+                            time_budget=lx_budget,
+                            quiet=not show_progress,
+                        )
+                        if lx_records:
+                            extracted = merge_langextract_into_word_multi_groups(
+                                extracted, profile, list(lx_records)
+                            )
+                            model_out = extracted
+                            meta["word_multi_branch"] = "parallel_plus_lx_prefill"
+                            meta["langextract_prefill"] = True
+                            meta["langextract_record_count"] = len(lx_records)
+                    except Exception as e:
+                        _log(
+                            f"[WARN] [word_multi_langextract_prefill] 补缺跳过（与通用 LangExtract 路径无关）: {e}"
+                        )
+                        meta["langextract_prefill_error"] = str(e)[:300]
+            return extracted, model_out, _with_routing(meta)
 
         TIME_BUDGET_SECONDS = time_budget
         start_time = time.perf_counter()
@@ -250,8 +544,25 @@ class CoreExtractionService(IExtractionService):
                 text_chunks = text_chunks[:max_chunks]
 
             if not text_chunks:
-                # 所有 chunk 均为表格，无文本需处理
-                return {}, {}, {"slicing_enabled": False, "slice_count": 0, "mode": "chunks_skipped_all_tables"}
+                # 所有 chunk 均为表格时，回退到全文 prompt 抽取，避免直接返回空结果。
+                if text and text.strip() and use_model:
+                    _log('[INFO] 语义块均为表格，回退到全文 prompt 抽取')
+                    prompt = self.build_smart_prompt(text, profile)
+                    from src.adapters.model_client import call_model
+                    elapsed = time.perf_counter() - start_time
+                    remaining_time = max(1, TIME_BUDGET_SECONDS - elapsed)
+                    total_deadline = time.time() + remaining_time
+                    raw = call_model(prompt, total_deadline=total_deadline)
+                    if isinstance(raw, dict) and "records" in raw:
+                        model_output = raw
+                    elif isinstance(raw, dict):
+                        model_output = {"records": [raw]}
+                    else:
+                        model_output = {"records": []}
+                    return model_output, model_output, _with_routing({
+                        "slicing_enabled": False, "slice_count": 1, "mode": "chunks_skipped_all_tables_fallback_full_text"
+                    })
+                return {}, {}, _with_routing({"slicing_enabled": False, "slice_count": 0, "mode": "chunks_skipped_all_tables"})
 
             total_chunks = len(text_chunks)
 
@@ -286,14 +597,14 @@ class CoreExtractionService(IExtractionService):
                 if lx_records is not None and len(lx_records) > 0:
                     _log(f'[INFO] langextract 提取成功: {len(lx_records)} 条记录')
                     merged = {"records": lx_records}
-                    return merged, merged, {
+                    return merged, merged, _with_routing({
                         "slicing_enabled": False, "slice_count": total_chunks,
                         "mode": "langextract", "chunk_count": total_chunks,
                         "layer_timeouts": {
                             "langextract_seconds": lx_elapsed,
                             "remaining_budget_seconds": TIME_BUDGET_SECONDS - (time.perf_counter() - start_time)
                         }
-                    }
+                    })
                 elif lx_records is not None:
                     _log('[INFO] langextract 返回空结果，回退到 prompt 方案')
             except TimeoutError:
@@ -328,10 +639,10 @@ class CoreExtractionService(IExtractionService):
                 else:
                     model_output = {}
                 extracted_raw = model_output
-                return extracted_raw, model_output, {
+                return extracted_raw, model_output, _with_routing({
                     "slicing_enabled": False, "slice_count": 1, "mode": "chunks_combined",
                     "chunk_count": total_chunks
-                }
+                })
 
             # 文本量大：逐块处理，每块独立提取后合并
             _log(f'[INFO] 语义分块模式：共 {total_chunks} 个文本块，{total_chars} 字符，逐块处理')
@@ -348,7 +659,7 @@ class CoreExtractionService(IExtractionService):
 
             if model_time_budget < 10:  # 最少10秒
                 _log(f'[WARN] 模型处理时间预算不足: {model_time_budget:.1f}s，跳过剩余分块')
-                return {}, {}, {"slicing_enabled": True, "slice_count": 0, "mode": "timeout_skip_all"}
+                return {}, {}, _with_routing({"slicing_enabled": True, "slice_count": 0, "mode": "timeout_skip_all"})
 
             _log(f'[INFO] 模型分块处理预算: {model_time_budget:.1f}s (总剩余: {remaining_total_time:.1f}s)')
 
@@ -418,10 +729,10 @@ class CoreExtractionService(IExtractionService):
                 all_records = self.merge_records_by_key(all_records, key_fields)
 
             merged_model_output = {"records": all_records} if all_records else {}
-            return merged_model_output, merged_model_output, {
+            return merged_model_output, merged_model_output, _with_routing({
                 "slicing_enabled": True, "slice_count": total_chunks,
                 "mode": "semantic_chunks", "chunk_count": total_chunks,
-            }
+            })
 
         # ── 回退：字符切片模式 ─────────────────────────────────────────────────
 
@@ -437,7 +748,7 @@ class CoreExtractionService(IExtractionService):
 
         if char_slice_time_budget < 10:  # 最少10秒
             _log(f'[WARN] 字符切片处理时间预算不足: {char_slice_time_budget:.1f}s，跳过处理')
-            return {}, {}, {"slicing_enabled": False, "slice_count": 0, "mode": "char_slice_timeout_skip"}
+            return {}, {}, _with_routing({"slicing_enabled": False, "slice_count": 0, "mode": "char_slice_timeout_skip"})
 
         _log(f'[INFO] 字符切片模式预算: {char_slice_time_budget:.1f}s (总剩余: {remaining_total_time:.1f}s)')
 
@@ -463,7 +774,7 @@ class CoreExtractionService(IExtractionService):
             else:
                 model_output = {}
             extracted_raw = model_output
-            return extracted_raw, model_output, {"slicing_enabled": False, "slice_count": 1, "mode": "direct"}
+            return extracted_raw, model_output, _with_routing({"slicing_enabled": False, "slice_count": 1, "mode": "direct"})
 
         # 需要切片
         _log(f'[INFO] 文档内容过长 ({len(text)} 字符)，启用字符切片模式')
@@ -554,7 +865,7 @@ class CoreExtractionService(IExtractionService):
             "mode": "char_slice",
         }
 
-        return extracted_raw, merged_model_output, slicing_metadata
+        return extracted_raw, merged_model_output, _with_routing(slicing_metadata)
 
     def merge_records_by_key(self, records: List[Dict], key_fields: Optional[List[str]] = None) -> List[Dict]:
         """基于关键字段的记录融合去重（智能增强版）。
@@ -598,7 +909,7 @@ class CoreExtractionService(IExtractionService):
         Args:
             text: 输入文本
             profile: 抽取配置文件
-            llm_mode: 抽取模式，可选 "full"（全文抽取）、"supplement"（仅补充缺失字段）、"off"（仅规则抽取）
+            llm_mode: 抽取模式，可选 "full"（默认）/"off"（仅规则抽取），"supplement" 兼容映射为 "full"
             slice_size: 字符切片大小（仅在无语义分块时使用）
             overlap: 字符切片重叠大小（仅在无语义分块时使用）
             max_chunks: 最大处理分块数
@@ -608,8 +919,9 @@ class CoreExtractionService(IExtractionService):
         Returns:
             抽取结果字典，包含records、metadata等信息
         """
-        # 根据llm_mode决定是否使用模型
-        use_model = llm_mode != "off"
+        # 根据规范化后的 llm_mode 决定是否使用模型（supplement -> full）
+        llm_mode_norm = normalize_llm_mode(llm_mode)
+        use_model = llm_mode_norm != "off"
 
         # 调用extract_with_slicing（兼容现有逻辑）
         extracted_raw, model_output, slicing_metadata = self.extract_with_slicing(
@@ -622,23 +934,21 @@ class CoreExtractionService(IExtractionService):
             time_budget=time_budget,
             chunks=None,  # 由调用方提供chunks
             max_chunks=max_chunks,
-            logger=None if quiet else None  # TODO: 支持logger
+            logger=None,
         )
 
         # 整合结果
         result = {
             "records": extracted_raw.get("records", []),
             "metadata": {
-                "llm_mode": llm_mode,
+                "llm_mode_requested": llm_mode,
+                "llm_mode": llm_mode_norm,
                 "slicing_metadata": slicing_metadata,
                 "use_model": use_model,
             },
             "extracted_raw": extracted_raw,
             "model_output": model_output,
         }
-
-        # TODO: 实现supplement模式（仅补充缺失字段）
-        # 当前版本将supplement视为full，后续需要实现规则预抽取+AI补充的逻辑
 
         return result
 
