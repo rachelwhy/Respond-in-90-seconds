@@ -603,7 +603,7 @@ def generate_profile_from_document(
                         from src.adapters.model_client import _fix_json_common_issues
                         fixed = _fix_json_common_issues(match.group())
                         raw = json.loads(fixed)
-                    except:
+                    except (json.JSONDecodeError, TypeError, ValueError):
                         raw = {}
             else:
                 # 没有找到 JSON 对象，设为空字典

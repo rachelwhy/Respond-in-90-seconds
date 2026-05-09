@@ -262,7 +262,7 @@ def fill_word_table(template_path: str, output_path: str, records, table_index: 
                 try:
                     import json
                     group_records = json.loads(group_records)
-                except:
+                except (json.JSONDecodeError, TypeError, ValueError):
                     # 如果解析失败，跳过这个表格
                     import logging
                     logging.getLogger(__name__).warning(

@@ -1042,26 +1042,36 @@ class CoreExtractionService(IExtractionService):
         return result
 
     def extract_from_document(self, document_path: str, profile: dict, **kwargs) -> Dict[str, Any]:
-        """从文档文件中提取结构化信息
+        """从文档文件中提取结构化信息。
 
-        Args:
-            document_path: 文档文件路径
-            profile: 抽取配置文件
-            **kwargs: 传递给extract_from_text的参数
-
-        Returns:
-            抽取结果字典
+        与 CLI/API 主链路一致：经 ``parser_factory.get_parser`` 解析出正文后再调用 ``extract_from_text``。
         """
-        # TODO: 集成文档读取逻辑，使用ParserService
-        # 临时实现：读取文本文件内容
+        path = Path(document_path)
+        if not path.is_file():
+            raise FileNotFoundError(f"文件不存在: {document_path}")
+
+        from src.adapters.parser_factory import get_parser
+
+        parser = get_parser(path)
+        if parser is None:
+            raise ValueError(f"不支持的文件格式或无法选择解析器: {path}")
+
         try:
-            with open(document_path, 'r', encoding='utf-8') as f:
-                text = f.read()
-            return self.extract_from_text(text, profile, **kwargs)
-        except UnicodeDecodeError:
-            # 如果是二进制文件（如Word、Excel），需要解析器
-            # 暂时抛出异常，等待ParserService实现
-            raise NotImplementedError(f"文档解析尚未实现，无法处理文件: {document_path}")
+            parse_result = parser.parse(path)
+        except Exception as e:
+            logger.warning("解析文档失败 %s: %s", path, e)
+            raise
+
+        if not isinstance(parse_result, dict):
+            parse_result = {}
+        if parse_result.get("error"):
+            logger.warning("解析器报告错误 %s: %s", path, parse_result.get("error"))
+
+        text = str(parse_result.get("text") or "")
+        if not text.strip():
+            logger.warning("文档解析得到空文本: %s", path)
+
+        return self.extract_from_text(text, profile, **kwargs)
 
     # ===== 工具方法 =====
 

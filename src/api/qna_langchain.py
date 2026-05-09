@@ -15,8 +15,13 @@ logger = logging.getLogger(__name__)
 
 
 def _build_chat_model(model_type: Optional[str]):
-    """按 ``MODEL_TYPE`` / 请求覆盖构造 LangChain Chat 模型（OpenAI 兼容走 Community ChatOpenAI）。"""
-    from langchain_community.chat_models import ChatOllama, ChatOpenAI
+    """按 ``MODEL_TYPE`` / 请求覆盖构造 LangChain Chat 模型（OpenAI 兼容优先 ``langchain_openai.ChatOpenAI``）。"""
+    from langchain_community.chat_models import ChatOllama
+
+    try:
+        from langchain_openai import ChatOpenAI
+    except ImportError:  # 兼容旧环境；优先 pip install langchain-openai
+        from langchain_community.chat_models import ChatOpenAI
 
     from src.config import (
         DEEPSEEK_API_KEY,

@@ -778,8 +778,8 @@ def extract_with_batch_api(
                         return parsed
                     elif isinstance(parsed, dict) and "records" in parsed:
                         return parsed["records"]
-                except:
-                    pass
+                except Exception:
+                    logger.debug("批量 JSON 补救解析失败", exc_info=True)
             logger.warning(f"批量API返回无法解析为JSON")
             return None
 
