@@ -34,7 +34,7 @@ Respond in 90 seconds_A23/
 ├── third_party/            # 内嵌第三方（如 langextract）
 ├── tests/                  # 单元 / 集成（默认不纳入 Git，见 .gitignore）
 ├── scripts/                # 运维脚本（如 verify_qna_deps、download_qna_embedding_model）与本地批测脚本
-├── profiles/               # 模板 profile 示例
+├── profiles/               # 可选：手写 profile JSON 示例（常规模板抽取无需准备此目录）
 ├── storage/                # API 任务与上传持久化
 ├── requirements.txt
 ├── CLAUDE.md
@@ -167,9 +167,20 @@ uvicorn api_server:app --host 0.0.0.0 --port 8000
 - 业务侧应使用 `result_json/result_xlsx`（或 `by_input`）进行消费。
 - `/api/extract/no-template` 生成结构化文件时会返回 `download_url`，后端拉取完成后可调用导出确认接口触发清理。
 
-## Profile配置示例
+## Profile（抽取档案）——默认自动生成
 
-profiles/contract.json：
+**常规模板填表 / `POST /api/extract/direct`：只需上传 Excel 或 Word 模板及数据文件**（可选附带抽取说明）。服务端会根据模板结构 **在内存中自动生成 profile**（列名、多表版式等），**不要求**事先编写 profile 配置文件。
+
+| 场景 | 说明 |
+|------|------|
+| **默认（推荐）** | 上传 `.xlsx` / `.docx` 模板 → 自动生成 profile → 抽取与填表。 |
+| **可选：落盘调试** | 环境变量 **`A23_PERSIST_PROFILES=true`** 时可将本次生成的 profile 写入磁盘，便于排障；默认关闭，不影响功能。 |
+| **可选：手写 JSON** | 若将「模板」指向 **`.json` profile 文件`**，则直接按文件内容抽取（完全自控，集成较少用）。`profiles/` 下仅为示例。 |
+| **全局规则（非 profile）** | 字段别名、归一化等见 **`src/knowledge/*.json`**，与单次任务的 profile 是两件事。 |
+
+### 进阶：JSON profile 形态示例（非必填）
+
+`profiles/contract.json` 仅说明 profile 数据结构，**多数对接不必编辑**：
 ```json
 {
   "report_name": "合同信息抽取",
@@ -193,7 +204,9 @@ profiles/contract.json：
 }
 ```
 
-系统支持可配置的字段归一化规则，配置文件位于 `src/knowledge/field_normalization_rules.json`：
+### 字段归一化（全局配置，非单次 profile）
+
+与单次模板生成的 profile 独立；按需修改 `src/knowledge/field_normalization_rules.json`：
 ```json
 {
   "rules": [
@@ -245,6 +258,9 @@ A: 检查API密钥是否正确，网络是否可访问DeepSeek API。
 
 ### Q5: OCR功能无法使用
 A: 确认已安装Tesseract和Poppler，并添加到系统PATH。
+
+### Q6: 是否需要先配置 profile？
+A: **通常不需要**。提供 Excel/Word 模板（及可选抽取说明）即可由服务 **自动生成 profile**。仅在进阶用法（直接上传 `.json` profile 作为模板）时才需要自行维护 profile 文件；调试时可开启 **`A23_PERSIST_PROFILES`** 查看落盘的生成结果。
 
 ## 架构升级说明（v3.0）
 
