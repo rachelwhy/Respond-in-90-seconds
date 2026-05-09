@@ -11,7 +11,6 @@
 from __future__ import annotations
 
 import json
-import logging
 import os
 import subprocess
 import sys
@@ -22,17 +21,7 @@ from queue import Queue, Empty
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
 from typing import Dict, List, Optional, Any
-from src.config import TASK_RETENTION_HOURS
-
-# 导入新的进程内任务执行器
-try:
-    from src.api.task_executor import get_task_executor, TaskExecutionError, NEW_ARCHITECTURE_AVAILABLE
-    IN_PROCESS_EXECUTION_AVAILABLE = True
-except ImportError as e:
-    import logging
-    logging.getLogger(__name__).warning(f"进程内任务执行器不可用: {e}")
-    IN_PROCESS_EXECUTION_AVAILABLE = False
-    NEW_ARCHITECTURE_AVAILABLE = False
+from src.config import EXTRACTION_TIMEOUT, TASK_RETENTION_HOURS
 
 STORAGE_ROOT = Path("storage/tasks")
 
@@ -258,7 +247,7 @@ class TaskManager:
             template_description = meta.get("template_description", "")
             instruction = meta.get("note", "")  # 网页端传入的抽取指令
             llm_mode = meta.get("llm_mode", "full")
-            total_timeout = meta.get("total_timeout", 110)
+            total_timeout = meta.get("total_timeout", EXTRACTION_TIMEOUT)
             max_chunks = meta.get("max_chunks", 50)
             quiet = meta.get("quiet", False)
 
@@ -291,7 +280,7 @@ class TaskManager:
 
                 if llm_mode and llm_mode != "full":
                     cmd += ["--llm-mode", llm_mode]
-                if total_timeout and total_timeout != 110:
+                if total_timeout and total_timeout != EXTRACTION_TIMEOUT:
                     cmd += ["--total-timeout", str(total_timeout)]
                 if max_chunks and max_chunks != 50:
                     cmd += ["--max-chunks", str(max_chunks)]
@@ -374,111 +363,51 @@ class TaskManager:
                     except Exception:
                         pass
 
-            # 检查是否可以使用进程内执行器
-            if IN_PROCESS_EXECUTION_AVAILABLE and NEW_ARCHITECTURE_AVAILABLE and not multi_input_mode:
-                log("使用进程内任务执行器")
-
-                # 构建任务配置
-                task_config = {
-                    "input_dir": str(input_dir),
-                    "output_dir": str(output_dir),
-                    "template_path": str(template_path) if template_path else None,
-                    "model_type": model_type,
-                    "template_mode": template_mode,
-                    "template_description": template_description,
-                    "llm_mode": llm_mode,
-                    "total_timeout": total_timeout,
-                    "max_chunks": max_chunks,
-                    "quiet": quiet,
-                    "output_basename": output_basename
-                }
-
-                # 使用进程内执行器
-                executor = get_task_executor()
-                # 创建日志回调函数
-                def log_callback(msg: str):
-                    log(msg)
-
-                # 执行任务
-                future = executor.execute_task(task_id, task_config, log_callback)
-
-                try:
-                    # 等待任务完成（阻塞当前线程，但这是后台线程，所以没问题）
-                    # 设置超时时间，给一些额外缓冲
-                    timeout_seconds = total_timeout + 120
-                    result = future.result(timeout=timeout_seconds)
-                    if result.get("status") == "success":
-                        self.update_status(task_id, "succeeded")
-                        log(f"任务成功完成，模式: {result.get('mode', 'unknown')}，耗时: {result.get('elapsed_time', 0):.1f}秒")
-                    else:
-                        self.update_status(task_id, "failed")
-                        log(f"任务失败: {result.get('error', '未知错误')}")
-
-                except Exception as e:
-                    # 捕获所有异常，包括concurrent.futures.TimeoutError
-                    self.update_status(task_id, "failed")
-                    if "timeout" in str(e).lower() or isinstance(e, TimeoutError):
-                        log("任务超时")
-                    else:
-                        log(f"任务执行异常: {e}")
-                    # 尝试取消任务
-                    try:
-                        executor.cancel_task(task_id)
-                    except:
-                        pass
+            if multi_input_mode:
+                log("检测到多输入文件：启用同模板逐文件顺序执行（每个文件独立抽取与输出）")
             else:
-                # 当进程内执行不可用时，回退到子进程执行路径。
-                if multi_input_mode:
-                    log("检测到多输入文件：启用同模板逐文件顺序执行（每个文件独立抽取与输出）")
-                elif not IN_PROCESS_EXECUTION_AVAILABLE:
-                    log("进程内执行器不可用，回退到子进程执行")
-                elif not NEW_ARCHITECTURE_AVAILABLE:
-                    log("新架构组件不可用，回退到子进程执行")
-                else:
-                    log("回退到子进程执行")
+                log("使用子进程执行 main.py")
 
-                # 通过环境变量传递模型类型（main.py 不支持 --model-type 参数）
-                env = os.environ.copy()
-                if model_type:
-                    env["A23_MODEL_TYPE"] = str(model_type).strip()
-                # 子进程 stdout/stderr 行缓冲：尽快写入 extraction.log，便于网页端/排查
-                env.setdefault("PYTHONUNBUFFERED", "1")
+            # 通过环境变量传递模型类型（main.py 不支持 --model-type 参数）
+            env = os.environ.copy()
+            if model_type:
+                env["A23_MODEL_TYPE"] = str(model_type).strip()
+            env.setdefault("PYTHONUNBUFFERED", "1")
 
-                # 外层 watchdog：必须明显大于 main.py 的 --total-timeout（本地大文档+LLM 可能较慢）
-                to = float(total_timeout or 110)
-                timeout_seconds = to + 300.0
-                if multi_input_mode:
-                    for idx, fname in enumerate(saved_inputs, start=1):
-                        input_target = input_dir / fname
-                        if not input_target.exists():
-                            self.update_status(task_id, "failed")
-                            log(f"任务失败：输入文件不存在 {input_target}")
-                            return
-                        out_basename = Path(fname).stem
-                        log(f"[{idx}/{len(saved_inputs)}] 开始处理：{fname}")
-                        cmd = _build_main_cmd(input_target, out_basename)
-                        rc, timed_out = _run_subprocess_and_stream(cmd, env, timeout_seconds)
-                        if rc != 0:
-                            self.update_status(task_id, "failed")
-                            if timed_out:
-                                log(f"[{idx}/{len(saved_inputs)}] 处理超时（>{int(timeout_seconds)}s），已终止")
-                            else:
-                                log(f"[{idx}/{len(saved_inputs)}] 处理失败，退出码: {rc}")
-                            return
-                    self.update_status(task_id, "succeeded")
-                    log("任务成功完成（多输入逐文件执行）")
-                else:
-                    cmd = _build_main_cmd(input_dir, output_basename)
+            to = float(total_timeout or EXTRACTION_TIMEOUT)
+            timeout_seconds = to + 300.0
+            if multi_input_mode:
+                for idx, fname in enumerate(saved_inputs, start=1):
+                    input_target = input_dir / fname
+                    if not input_target.exists():
+                        self.update_status(task_id, "failed")
+                        log(f"任务失败：输入文件不存在 {input_target}")
+                        return
+                    out_basename = Path(fname).stem
+                    log(f"[{idx}/{len(saved_inputs)}] 开始处理：{fname}")
+                    cmd = _build_main_cmd(input_target, out_basename)
                     rc, timed_out = _run_subprocess_and_stream(cmd, env, timeout_seconds)
-                    if rc == 0:
-                        self.update_status(task_id, "succeeded")
-                        log("任务成功完成")
-                    else:
+                    if rc != 0:
                         self.update_status(task_id, "failed")
                         if timed_out:
-                            log(f"任务超时（>{int(timeout_seconds)}s），已终止子进程")
+                            log(f"[{idx}/{len(saved_inputs)}] 处理超时（>{int(timeout_seconds)}s），已终止")
                         else:
-                            log(f"任务失败，退出码: {rc}")
+                            log(f"[{idx}/{len(saved_inputs)}] 处理失败，退出码: {rc}")
+                        return
+                self.update_status(task_id, "succeeded")
+                log("任务成功完成（多输入逐文件执行）")
+            else:
+                cmd = _build_main_cmd(input_dir, output_basename)
+                rc, timed_out = _run_subprocess_and_stream(cmd, env, timeout_seconds)
+                if rc == 0:
+                    self.update_status(task_id, "succeeded")
+                    log("任务成功完成")
+                else:
+                    self.update_status(task_id, "failed")
+                    if timed_out:
+                        log(f"任务超时（>{int(timeout_seconds)}s），已终止子进程")
+                    else:
+                        log(f"任务失败，退出码: {rc}")
 
         except Exception as e:
             self.update_status(task_id, "failed")

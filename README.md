@@ -12,7 +12,7 @@ A23赛题算法后端：基于RAG的异构文档理解与信息抽取系统
 - **可配置后处理**：通用字段归一化框架，支持JSON配置的规则链
 - **智能记录合并**：基于关键字段的记录去重与融合
 - **多模型支持**：Ollama本地模型、DeepSeek API、OpenAI兼容API、Qwen等
-- **RAG集成**：可选LangChain集成，自动降级到手写RAG
+- **文档问答（HTTP）**：`POST /api/qna/ask`，默认 **LangChain** `ConversationalRetrievalChain` + **Chroma** + **HuggingFaceEmbeddings**，失败或未启用时回退 BM25+向量混合检索；可选关闭算法侧会话落盘并传 `history_json`（详见 [HTTP_API_USAGE.md](HTTP_API_USAGE.md)）
 - **工程鲁棒性**：总超时控制、持久化缓存、任务状态管理、优雅降级
 
 ## 目录结构（与当前仓库一致）
@@ -26,13 +26,14 @@ Respond in 90 seconds_A23/
 ├── docs/                   # 部署说明与文档索引
 ├── src/
 │   ├── adapters/           # 模型、Docling、解析器工厂、langextract 适配等
-│   ├── api/                # direct_extractor、task_manager、qna_service
+│   ├── api/                # direct_extractor、task_manager、qna_service、qna_langchain、qna_retrieval
 │   ├── core/               # 抽取服务、extraction_routing、后处理、reader、writers、profile 等
 │   ├── knowledge/          # 别名与归一化等知识资源
+│   ├── observability/      # Prometheus 等指标（可选）
 │   └── config.py
 ├── third_party/            # 内嵌第三方（如 langextract）
-├── tests/                  # 单元 / 集成 — .gitignore 可能忽略，按团队规范
-├── scripts/                # 批处理 / 调试脚本
+├── tests/                  # 单元 / 集成（默认不纳入 Git，见 .gitignore）
+├── scripts/                # 运维脚本（如 verify_qna_deps、download_qna_embedding_model）与本地批测脚本
 ├── profiles/               # 模板 profile 示例
 ├── storage/                # API 任务与上传持久化
 ├── requirements.txt
@@ -73,8 +74,8 @@ python -m venv .venv
 source .venv/bin/activate     # Linux/macOS
 pip install -r requirements.txt
 
-# 可选RAG集成（LangChain）
-pip install langchain langchain-community chromadb
+# 问答检索依赖已写入 requirements.txt（rank-bm25、sentence-transformers）；装完后可自检：
+# python scripts/verify_qna_deps.py
 
 # OCR系统依赖（需要单独安装）
 # 1. Tesseract OCR: https://github.com/UB-Mannheim/tesseract/wiki
@@ -82,33 +83,18 @@ pip install langchain langchain-community chromadb
 ```
 
 ### 3. 配置模型
-创建 `.env` 文件（参考 `.env.example`）：
+默认使用 **DeepSeek API**（与仓库联调、本地测试一致）。复制 `.env.example` 为 `.env`，至少填写 `A23_DEEPSEEK_API_KEY`；无需每次改 `A23_MODEL_TYPE`（默认已是 `deepseek`）。
+
+改用 Ollama 或其它端点时见 `.env.example` 内注释说明。
 
 ```ini
-# DeepSeek API配置
-A23_MODEL_TYPE=deepseek
-A23_DEEPSEEK_BASE_URL=https://api.deepseek.com/v1
 A23_DEEPSEEK_API_KEY=sk-your-api-key-here
-A23_DEEPSEEK_MODEL=deepseek-chat
-
-# Ollama配置
-A23_MODEL_TYPE=ollama
-A23_OLLAMA_MODEL=qwen2.5:7b
-
-# 通用配置
-A23_TARGET_LIMIT_SECONDS=40
-A23_FUZZY_THRESHOLD=75
-A23_NORMALIZATION_CONFIG=src/knowledge/field_normalization_rules.json
-A23_ENABLE_OCR=false
 ```
 
-### 4. 准备模型（选择一种）
+### 4. 准备模型（可选）
 ```bash
-# Ollama本地模型
+# 仅在使用 Ollama 时需要
 ollama pull qwen2.5:7b
-
-# 或使用DeepSeek API（需配置API密钥）
-# 无需本地模型
 ```
 
 ## 快速开始
@@ -152,28 +138,28 @@ uvicorn api_server:app --host 0.0.0.0 --port 8000
 
 启动服务后访问：http://localhost:8000/docs
 
+**生产对接建议**：业务后端自有异步队列时，worker 调用 **`POST /api/extract/direct`**（同步）；算法端内置 **`/api/tasks/*`** 默认关闭，避免与业务任务模型重复。
+
 | 接口 | 方法 | 说明 |
 |------|------|------|
 | `/api/health` | GET | 健康检查 |
-| `/api/tasks` | GET | 任务列表（受 `A23_ENABLE_TASKS` 控制） |
-| `/api/tasks/create` | POST | 创建异步任务（multipart） |
-| `/api/tasks/{task_id}` | GET | 任务状态与输出路径 |
-| `/api/tasks/{task_id}/result` | GET | 任务结果摘要 |
-| `/api/tasks/{task_id}/export-complete` | POST | 后端确认导出后清理任务 |
-| `/api/extract/direct` | POST | 同步直接抽取 |
+| `/api/extract/direct` | POST | **推荐**：同步模板抽取（multipart） |
+| `/api/extract/pre-analyze` | POST | 可选：复杂度预估算 |
 | `/api/extract/no-template` | POST | 无模板抽取 |
 | `/api/download/temp/{filename}/export-complete` | POST | 后端确认临时导出已接收并删除 |
-| `/api/qna/ask` | POST | 文档问答（可选 LangChain） |
+| `/api/qna/ask` | POST | 文档问答（默认 LangChain；回退混合检索；可选 `history_json` / `persist_session` / `A23_QNA_USE_LANGCHAIN`，见 HTTP_API_USAGE） |
+| `/api/tasks/*` | 多种 | **可选**：仅 `A23_ENABLE_TASKS=true` 时可用（本地/无队列长任务） |
 
-详细说明见 [HTTP_API_USAGE.md](HTTP_API_USAGE.md)
+详细说明与权责边界见 [HTTP_API_USAGE.md](HTTP_API_USAGE.md)
 
 ## 行为与环境变量（API / 任务）
 
-- **`A23_ENABLE_TASKS`**：为 `false` 时 `/api/tasks/*` 不可用。
-- **`A23_PERSIST_UPLOADS` / `A23_PERSIST_PROFILES`**：是否持久化上传与自动生成 profile。
-- **`A23_TASK_RETENTION_HOURS` 等**：任务与上传目录清理策略（小时）。
-- **`A23_DEBUG`**：调试模式；`report_bundle` 调试产物仅在调试链路开放。
-- 异步任务由子进程执行 `main.py`；子进程设置 **`PYTHONUNBUFFERED=1`** 便于日志落盘。外层 watchdog 约为 **`total_timeout + 300` 秒**（缓冲），与 `main.py --total-timeout` 配合使用。
+**完整变量表与接口契约以 [HTTP_API_USAGE.md](HTTP_API_USAGE.md) 为唯一权威来源**，以下为高频摘要：
+
+- **抽取主路径**：业务异步队列 + worker 调用 **`POST /api/extract/direct`**；算法内置 **`/api/tasks/*`** 默认 **`A23_ENABLE_TASKS=false`**。
+- **浏览器 / 网页对话框**：已启用 **CORS**（默认本地常见端口 + 私网段正则；生产追加 **`A23_CORS_ORIGINS`**）。同源网关部署不受跨域限制。
+- **文档问答**：默认 **`A23_QNA_MODEL_TYPE=deepseek`**（与抽取 **`A23_MODEL_TYPE`** 独立）；句向量默认离线优先 **`models/qna_embedding`**（详见 HTTP_API_USAGE「文档问答」）。
+- **持久化**：**`A23_PERSIST_UPLOADS`**、**`A23_QNA_PERSIST_SESSION`**、各目录保留小时数等见 HTTP_API_USAGE。
 
 ### 后端对接输出约定
 

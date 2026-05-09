@@ -6,33 +6,26 @@ import json
 import re
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
+from src.core.knowledge_data import load_json_array
 
-# 统一兜底候选键（从强约束到弱约束），可覆盖多行业表格记录。
-FALLBACK_KEY_CANDIDATES: List[Tuple[str, ...]] = [
-    ("省", "市", "区", "站点名称", "监测时间"),
-    ("城市", "区", "站点名称", "监测时间"),
-    ("城市", "区", "站点名称"),
-    ("城市", "站点名称"),
-    ("地区", "区", "站点名称"),
-    ("省", "市", "区", "名称"),
-    ("省", "市", "名称"),
-    ("城市", "名称"),
-    ("地区", "名称"),
-    ("单位", "名称"),
-    ("公司", "名称"),
-    ("项目", "名称"),
-    ("id",),
-    ("ID",),
-    ("编号",),
-    ("编码",),
-    ("code",),
-    ("city", "district", "site_name", "monitor_time"),
-    ("city", "district", "site_name"),
-    ("city", "site_name"),
-    ("province", "city", "name"),
-    ("name", "id"),
-    ("name",),
-]
+# 兜底候选复合键：从 ``src/knowledge/record_dedup_key_fallbacks.json`` 加载（列表的列表），
+# 默认可为空；仅人工审核后写入知识库，不在逻辑中硬编码业务列名。
+_FALLBACK_CACHE: Optional[List[Tuple[str, ...]]] = None
+
+
+def _fallback_key_candidates() -> List[Tuple[str, ...]]:
+    global _FALLBACK_CACHE
+    if _FALLBACK_CACHE is not None:
+        return _FALLBACK_CACHE
+    raw = load_json_array("record_dedup_key_fallbacks.json")
+    out: List[Tuple[str, ...]] = []
+    for item in raw:
+        if isinstance(item, list) and item:
+            tup = tuple(str(x).strip() for x in item if str(x).strip())
+            if tup:
+                out.append(tup)
+    _FALLBACK_CACHE = out
+    return _FALLBACK_CACHE
 
 _UNIT_RE = re.compile(
     r"\s*(亿元|万元|千元|百元|元|亿|万|千|百|%|％|‰|万人|千人|人|平方公里|km²|亿美元|万美元|美元)\s*$",
@@ -72,7 +65,7 @@ def choose_dedup_fields(
         if pref and all(k in non_empty for k in pref):
             return pref
 
-    candidates: List[Tuple[str, ...]] = list(FALLBACK_KEY_CANDIDATES)
+    candidates: List[Tuple[str, ...]] = list(_fallback_key_candidates())
     if extra_candidates:
         candidates = [tuple(str(x).strip() for x in c if str(x).strip()) for c in extra_candidates] + candidates
 

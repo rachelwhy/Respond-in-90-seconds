@@ -26,8 +26,12 @@ def _row_non_empty_count(rec: dict) -> int:
     return n
 
 
+# 无显式 filter 时：从说明文本用轻量模式匹配提取可能与分组相关的片段；目标列名采用与多数模板兼容的 fallback（可改为配置）
+_HEURISTIC_REGION_COLUMN = "城市"
+
+
 def _infer_group_filter(spec: Dict[str, Any]) -> tuple[str, str]:
-    """从 table spec 推断分组条件，优先使用显式配置，其次从表上方说明提取城市。"""
+    """推断分组条件：优先 filter_field/filter_value；否则从说明里启发式提取（见模块常量）。"""
     ff = (spec.get("filter_field") or "").strip()
     fv = (spec.get("filter_value") or "").strip()
     if ff and fv:
@@ -39,7 +43,7 @@ def _infer_group_filter(spec: Dict[str, Any]) -> tuple[str, str]:
     )
     m = re.search(r"([\u4e00-\u9fa5]{2,10}市)", text)
     if m:
-        return "城市", m.group(1)
+        return _HEURISTIC_REGION_COLUMN, m.group(1)
     return "", ""
 
 
@@ -115,7 +119,7 @@ def merge_internal_structured_into_word_multi_groups(
                 new_groups.append(g)
             continue
 
-        # LLM 无行、或每行有效字段≤1（通常只有城市）→ 用内部表数据替换
+        # LLM 无行或行内有效字段过少（启发式认为信息不足）→ 用内部表数据替换
         need_replace = (not cur) or all(_row_non_empty_count(row) <= 1 for row in cur if isinstance(row, dict))
         if need_replace:
             gg = dict(g)

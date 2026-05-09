@@ -61,13 +61,25 @@ harness/*
 .pytest_cache/
 uv_err.txt
 .backup/
+.cursor/
+agent-tools/
 
-# 单元测试、集成测试与批处理脚本（仅本地保留，不上传仓库）
+# 调试/跑数产生的临时表格（勿提交）
+*_result*.xlsx
+
+# 单元 / 集成测试（仅本地保留，不上传仓库）
 tests/
-scripts/
+
+# 批测与一次性脚本（默认排除）；运维必需脚本见下方例外
+scripts/*
+!scripts/download_qna_embedding_model.py
+!scripts/verify_qna_deps.py
 
 # 本地基准 / 一次性跑分输出
 .benchmarks/
+
+# 本地预下载的句向量模型（体积大，勿提交）
+models/qna_embedding/
 
 # 运行期生成的向量库 / 缓存 / 记忆类目录（RAG、Chroma 等）
 chroma/

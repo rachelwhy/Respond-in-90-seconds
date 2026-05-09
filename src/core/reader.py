@@ -18,7 +18,7 @@ def collect_input_bundle(input_dir: str) -> Dict[str, Any]:
             "file_count": int,
         }
     """
-    from src.adapters.parser_factory import get_parser, SUPPORTED_SUFFIXES
+    from src.adapters.parser_factory import resolve_parser
 
     input_path = Path(input_dir)
     if not input_path.exists():
@@ -26,6 +26,7 @@ def collect_input_bundle(input_dir: str) -> Dict[str, Any]:
 
     documents = []
     text_parts = []
+    warnings: List[str] = []
 
     # 兼容：input_dir 既可以是目录也可以是单文件
     if input_path.is_file():
@@ -36,10 +37,9 @@ def collect_input_bundle(input_dir: str) -> Dict[str, Any]:
     for f in files:
         if not f.is_file():
             continue
-        if f.suffix.lower() not in SUPPORTED_SUFFIXES:
-            continue
-        parser = get_parser(f)
+        parser, dispatch_reason = resolve_parser(f)
         if parser is None:
+            warnings.append(f"{f.name}: skip ({dispatch_reason})")
             continue
         try:
             result = parser.parse(f)
@@ -49,11 +49,13 @@ def collect_input_bundle(input_dir: str) -> Dict[str, Any]:
                 text_parts.append(f"【文件名】{f.name}\n{text}")
         except Exception as e:
             documents.append({"path": str(f), "error": str(e), "text": ""})
+            warnings.append(f"{f.name}: parse_error ({e})")
 
     return {
         "all_text": "\n\n".join(text_parts),
         "documents": documents,
         "file_count": len(documents),
+        "warnings": warnings,
     }
 
 
@@ -97,8 +99,7 @@ def try_internal_structured_extract(profile: dict, loaded_bundle: Dict[str, Any]
     template_fields = profile.get("fields", [])
     field_names = [f["name"] if isinstance(f, dict) else f for f in template_fields]
 
-    # 多表 Word 场景：为“分组过滤条件”补充辅助字段（如监测时间），
-    # 便于后续按约束精确分表；这些字段不要求必须写回模板。
+    # 多表 Word：为指令或约束中出现、但模板未声明的维度补充辅助字段名，便于在源表行上施加过滤；不要求写回模板。
     helper_names = set()
     if profile.get("template_mode") == "word_multi_table":
         for spec in profile.get("table_specs") or []:

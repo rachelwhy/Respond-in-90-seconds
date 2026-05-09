@@ -2,9 +2,11 @@
 
 ## 上线形态（以网页/API 为准）
 
-- **同步抽取**：`api_server.py` → `src/api/direct_extractor.py` → `CoreExtractionService.extract_with_slicing`（与 CLI 共用核心服务）。
-- **异步任务**：`POST /api/tasks/create` → `task_manager` 子进程执行 `main.py`（长任务、落盘、日志）。
-- **命令行 `main.py`**：便于开发、回归与无 HTTP 环境；功能应对齐 API，但**不以 CLI 为唯一事实来源**。
+- **同步抽取**：`api_server.py` → `src/api/direct_extractor.py` → `src/core/model_extraction_orchestrator.py`（统一模型编排）→ `extract_with_slicing`。
+- **可选：算法内置异步任务**：`POST /api/tasks/create` → `task_manager` 子进程执行 `main.py`；**默认** `A23_ENABLE_TASKS=false` 关闭路由；本地联调长任务时可设 `true`。
+- **命令行 `main.py`**：便于开发、回归与无 HTTP 环境；与 API 共用 `model_extraction_orchestrator` / `extraction_result_harmonizer` / `result_packager` / `output_writer_orchestrator` / `runtime_observability`，但**不以 CLI 为唯一事实来源**。
+- **文档问答**：`POST /api/qna/ask` → `qna_service`：默认 **`qna_langchain`**（LangChain + Chroma + HuggingFaceEmbeddings），失败或 **`A23_QNA_USE_LANGCHAIN=false`** 时用 **`qna_retrieval`**（BM25 + 句向量）；生成答案默认 **`A23_QNA_MODEL_TYPE=deepseek`**（与抽取 **`A23_MODEL_TYPE`** 独立）。会话目录 `storage/sessions/` 仅在 **`A23_QNA_PERSIST_SESSION=true`**（默认）时长期保留；业务侧自管会话与文件时设 **`false`** 并每次上传 `files`、可选 `history_json`。详见根目录 `HTTP_API_USAGE.md`。
+- **浏览器跨域（网页端调 API）**：`api_server` 已挂 **`CORSMiddleware`**；默认含常见本地 Origin 与私网段正则，生产环境追加 **`A23_CORS_ORIGINS`**。变量与行为以 **`HTTP_API_USAGE.md`** 为准。
 
 ## 后端对接关键约定
 
@@ -21,9 +23,10 @@
 
 ## 存储与保留策略
 
-- 任务目录：`storage/tasks/<task_id>/...`（受 `A23_TASK_RETENTION_HOURS` 控制）
-- 上传目录：`storage/uploads/<request_id>/...`（受 `A23_UPLOAD_RETENTION_HOURS` 控制）
+- 异步任务目录：`storage/tasks/<task_id>/...`（`A23_TASK_RETENTION_HOURS`）
+- 上传根 `storage/uploads/`：同步 `/api/extract/direct` 在 `A23_PERSIST_UPLOADS=true` 时为 `<task_id>/inputs`、`output/`；其它请求亦为该根下子目录（`A23_UPLOAD_RETENTION_HOURS`）
 - 临时导出：`storage/uploads/temp/<filename>`（受 `A23_TEMP_RETENTION_HOURS` 控制）
+- 问答会话：`storage/sessions/<id>/`（仅持久化模式写入；见 `A23_QNA_PERSIST_SESSION`）
 - 目录清理时 `storage/uploads/temp` 会按临时文件策略单独管理。
 
 ## 输入与路由元数据
@@ -43,7 +46,8 @@
 | 变量 | 作用 |
 |------|------|
 | `A23_WORD_MULTI_PARALLEL` | 是否启用多表 Word 并行 LLM |
-| `A23_WORD_MULTI_LANGEXTRACT` | 多表并行后 LangExtract 补缺：未设=自动；1=强开；0=关 |
 | `A23_WORD_MULTI_MERGE_INTERNAL` | 后处理是否用 Docling/表直读合并进 `_table_groups` |
+
+多表 Word 并行之后的 LangExtract 补缺由 `extraction_routing.decide_word_multi_langextract_prefill` 按模板/表头自动决定，**不再提供**单独环境变量开关。
 
 详见 `src/config.py` 与 `HTTP_API_USAGE.md`。

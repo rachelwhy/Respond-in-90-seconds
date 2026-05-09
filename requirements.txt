@@ -11,9 +11,17 @@ python-dotenv==1.0.0
 bcrypt==4.0.1
 passlib[bcrypt]==1.7.4
 
-# 文本处理
-numpy==1.24.0
+# 文本处理（numpy 需与 sentence-transformers / torch / docling 共存；2.2.x 已与 QA 栈联调验证）
+numpy>=1.24.0,<3.0.0
 jieba==0.42.1
+
+# 文档问答（POST /api/qna/ask）：默认 LangChain ConversationalRetrievalChain + Chroma + HuggingFaceEmbeddings；回退为 BM25 + 向量混合（rank-bm25 + sentence-transformers）
+langchain>=0.3.13,<0.4.0
+langchain-community>=0.3.13,<0.4.0
+langchain-core>=0.3.13,<0.4.0
+chromadb>=0.5.0
+rank-bm25==0.2.2
+sentence-transformers==5.4.1
 
 # 图片处理与OCR
 Pillow==10.0.0
@@ -40,16 +48,10 @@ docling>=2.0.0
 langextract[openai]>=0.1.0  # 包含 OpenAI 兼容 API 支持，用于 DeepSeek/OpenAI/Qwen
 diskcache>=5.6.3
 prometheus-client>=0.20.0
-
-# 语义相似度计算（可选）
-sentence-transformers>=2.2.0
+# 可选：A23_USE_LITELLM=true 时统一走 LiteLLM（多模型/重试/路由）
+litellm>=1.40.0
 
 # 数据库（MySQL 入库）
 pymysql>=1.1.0
 
-# LangChain RAG 集成（可选，需要单独安装）
-# 安装命令：pip install langchain langchain-community chromadb
-# 安装后，qna_service.py 将自动切换到 LangChain ConversationalRetrievalChain
-# langchain>=0.2.0
-# langchain-community>=0.2.0
-# chromadb>=0.5.0
+# QnA 回退路径仍依赖 rank-bm25 + sentence-transformers；环境变量 A23_QNA_USE_LANGCHAIN=false 可仅用混合检索。

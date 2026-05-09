@@ -21,97 +21,40 @@ import re
 import sys
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, as_completed, wait
 from typing import Any, Dict, List, Optional
+from src.core.debug_flags import is_debug_enabled
+from src.config import config_manager
 
 # 模型检测 - 简化版本（不依赖ModelRegistry）
 # 从环境变量或config.py获取模型信息
 _model_registry = None  # 不再使用ModelRegistry
 
-def get_model_size(model_name: str) -> int:
-    """简化的模型大小检测"""
-    # 通过模型名称判断大小
-    if "7b" in model_name.lower() or "8b" in model_name.lower():
-        return 7
-    elif "14b" in model_name.lower():
-        return 14
-    elif "32b" in model_name.lower() or "34b" in model_name.lower():
-        return 32
-    elif "70b" in model_name.lower():
-        return 70
-    else:
-        # 默认为7B
-        return 7
-
-def is_cloud_model(model_type: str) -> bool:
-    """判断是否为云API模型"""
-    return model_type in ("deepseek", "openai", "qwen")
-
 logger = logging.getLogger(__name__)
 
-# 默认禁用 stdout 级别调试输出（网页端会被污染）。
-# 仅当 A23_DEBUG=true/1/yes/on 时输出调试信息。
-def _debug_enabled() -> bool:
-    v = os.environ.get("A23_DEBUG", "").strip().lower()
-    return v in ("1", "true", "yes", "on", "y")
-
-
 def _dprint(msg: str):
-    if _debug_enabled():
+    if is_debug_enabled():
         logger.debug(msg)
-
-# 配置管理 - 简化版本（不依赖ConfigManager）
-# 直接使用环境变量和config.py
-_config = None  # 不再使用ConfigManager
 
 # 优先使用本地修改版的 langextract
 third_party_path = os.path.join(os.path.dirname(__file__), '..', '..', 'third_party')
 
 # 配置获取辅助函数
 def _get_config(key: str, default: Any = None) -> Any:
-    """获取配置值，优先使用ConfigManager，失败时回退到os.environ"""
-    if _config is not None:
-        return _config.get(key, default)
-    else:
-        # 向后兼容
-        env_key = f"A23_{key}"
-        return os.environ.get(env_key, default)
+    """统一配置读取（经 src.config）。"""
+    return config_manager.get(key, default)
 
 def _get_config_int(key: str, default: int = 0) -> int:
     """获取整数配置值"""
-    if _config is not None:
-        return _config.get_int(key, default)
-    else:
-        # 向后兼容
-        env_key = f"A23_{key}"
-        value = os.environ.get(env_key, str(default))
-        try:
-            return int(value)
-        except ValueError:
-            return default
+    return config_manager.get_int(key, default)
 
 def _get_config_float(key: str, default: float = 0.0) -> float:
     """获取浮点数配置值"""
-    if _config is not None:
-        return _config.get_float(key, default)
-    else:
-        # 向后兼容
-        env_key = f"A23_{key}"
-        value = os.environ.get(env_key, str(default))
-        try:
-            return float(value)
-        except ValueError:
-            return default
+    return config_manager.get_float(key, default)
 
 def _get_config_bool(key: str, default: bool = False) -> bool:
     """获取布尔值配置值"""
-    if _config is not None:
-        return _config.get_bool(key, default)
-    else:
-        # 向后兼容
-        env_key = f"A23_{key}"
-        value = os.environ.get(env_key, str(default)).lower()
-        return value in ("true", "1", "yes", "on")
+    return config_manager.get_bool(key, default)
 if os.path.exists(third_party_path):
     sys.path.insert(0, third_party_path)
     logger.debug(f"添加第三方库路径: {third_party_path}")
@@ -182,8 +125,8 @@ def _create_langextract_model(model_type: str):
     if model_type in ("deepseek", "openai", "qwen"):
         from langextract.providers.openai import OpenAILanguageModel
 
-        # 关键：禁用 provider 内部并行，避免和外层并行叠加
-        provider_workers = _get_config_int("LANGEXTRACT_PROVIDER_WORKERS", 1)
+        # 关键：禁用 provider 内部并行，避免和外层并行叠加（固定为 1，不暴露配置）
+        provider_workers = 1
 
         if model_type == "deepseek":
             api_key = _get_config("DEEPSEEK_API_KEY", "").strip()
@@ -544,7 +487,7 @@ def _align_records_to_fields(records: List[Dict], field_names: List[str]) -> Lis
 def extract_with_langextract(
     text_chunks: List[Dict],
     profile: dict,
-    time_budget: float = None,
+    time_budget: Optional[float] = None,
     quiet: bool = False,
 ) -> Optional[List[Dict]]:
     _dprint(f"extract_with_langextract called: chunks={len(text_chunks)}, quiet={quiet}")
@@ -563,7 +506,7 @@ def extract_with_langextract(
 
     try:
         # 1. 获取模型
-        model_type = _get_config("MODEL_TYPE", "ollama").strip().lower()
+        model_type = _get_config("MODEL_TYPE", "deepseek").strip().lower()
         _dprint(f"extract_with_langextract: model_type='{model_type}'")
         model_instance, model_id, is_cloud, model_size = _create_langextract_model(model_type)
         _dprint(f"extract_with_langextract: model_id={model_id}, is_cloud={is_cloud}, model_size={model_size}B")
@@ -593,12 +536,12 @@ def extract_with_langextract(
             )
         elif strategy == "parallel":
             records = extract_with_langextract_parallel(
-                text_chunks, profile, max_workers, quiet
+                text_chunks, profile, max_workers, quiet, time_budget=time_budget
             )
         else:
             # 当前版本不走 batch，统一回退到 parallel
             records = extract_with_langextract_parallel(
-                text_chunks, profile, max_workers, quiet
+                text_chunks, profile, max_workers, quiet, time_budget=time_budget
             )
 
         # 5. 结果处理
@@ -651,6 +594,7 @@ def extract_with_langextract_parallel(
     profile: dict,
     max_workers: int = 2,
     quiet: bool = False,
+    time_budget: Optional[float] = None,
 ) -> Optional[List[Dict]]:
     """并行版本的多分块提取
 
@@ -659,7 +603,7 @@ def extract_with_langextract_parallel(
     - 每个线程独立创建模型实例，避免共享 client 的线程安全问题
     - 外层并行，内层 provider 并行固定为 1
     """
-    model_type = _get_config("MODEL_TYPE", "ollama").strip().lower()
+    model_type = _get_config("MODEL_TYPE", "deepseek").strip().lower()
 
     # 单块时直接走最小闭环
     if len(text_chunks) <= 1:
@@ -705,8 +649,25 @@ def extract_with_langextract_parallel(
                 executor.submit(process_chunk, i, chunk)
                 for i, chunk in enumerate(text_chunks)
             ]
-            for future in as_completed(futures):
-                future.result()
+            if time_budget is not None and float(time_budget) > 0:
+                done, not_done = wait(futures, timeout=float(time_budget))
+                if not_done and not quiet:
+                    logger.warning(
+                        "LangExtract 并行在 %.1fs 内未全部完成，取消剩余 %s 个任务",
+                        float(time_budget),
+                        len(not_done),
+                    )
+                for f in not_done:
+                    f.cancel()
+                for f in futures:
+                    if f.done():
+                        try:
+                            f.result()
+                        except Exception:
+                            pass
+            else:
+                for future in as_completed(futures):
+                    future.result()
 
         merged_results = deduplicate_records(results)
 
@@ -760,7 +721,7 @@ def extract_with_batch_api(
         提取的记录列表，失败时返回 None（触发回退）
     """
     # 仅当使用云 API 且块数 > 1 时启用
-    model_type = _get_config("MODEL_TYPE", "ollama").strip().lower()
+    model_type = _get_config("MODEL_TYPE", "deepseek").strip().lower()
     is_cloud = model_type in ("deepseek", "openai", "qwen")
 
     if not is_cloud or len(text_chunks) <= 1:
@@ -832,15 +793,15 @@ def extract_with_batch_api(
 def get_optimal_strategy(text_chunks: List[Dict], profile: dict) -> dict:
     """根据条件选择最优处理策略
 
-    当前稳定性优先策略：
-    - 云 API：单块走 single，多块走 parallel，并发固定上限 2
-    - 本地模型：单块走 single，多块也可走 parallel，但先保守为 1
-    - 暂时禁用 batch，等主链路稳定后再恢复
+    算法侧并行度使用固定保守上限；进程/网关级并发由部署与后端负责。
     """
     total_chars = sum(len(chunk.get("text", "")) for chunk in text_chunks)
     chunk_count = len(text_chunks)
-    model_type = _get_config("MODEL_TYPE", "ollama").strip().lower()
+    model_type = _get_config("MODEL_TYPE", "deepseek").strip().lower()
     is_cloud = model_type in ("deepseek", "openai", "qwen")
+
+    # 云 API：多块时最多 2 路并行；本地：最多 1 路（避免与 Ollama 单实例争抢）
+    _cloud_parallel_cap = 2
 
     if is_cloud:
         if chunk_count <= 1:
@@ -848,14 +809,14 @@ def get_optimal_strategy(text_chunks: List[Dict], profile: dict) -> dict:
             max_workers = 1
         else:
             strategy = "parallel"
-            max_workers = min(2, chunk_count)
+            max_workers = min(_cloud_parallel_cap, chunk_count)
     else:
         if chunk_count <= 1:
             strategy = "single"
             max_workers = 1
         else:
             strategy = "parallel"
-            max_workers = 1
+            max_workers = min(1, chunk_count)
 
     return {
         "strategy": strategy,
@@ -969,6 +930,6 @@ def _apply_anchor_backfill_records(records: List[Dict], field_names: List[str]) 
             changed += 1
         r.pop("_anchor_text", None)
 
-    if changed and not _debug_enabled():
+    if changed and not is_debug_enabled():
         logger.info("langextract: 锚点回填已应用，字段=%s，回填记录=%s", target_field, changed)
     return rows

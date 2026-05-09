@@ -2,7 +2,6 @@ import json
 import re
 import os
 import requests
-import threading
 from typing import Optional, Dict, Any, List, Union
 import logging
 
@@ -18,8 +17,10 @@ from src.config import (
     MODEL_TYPE, OLLAMA_URL, OLLAMA_MODEL, OPENAI_BASE_URL, OPENAI_API_KEY, OPENAI_MODEL,
     MODEL_NAME, EMBEDDING_URL, EMBEDDING_MODEL, DEEPSEEK_BASE_URL, DEEPSEEK_API_KEY, DEEPSEEK_MODEL,
     QWEN_BASE_URL, QWEN_API_KEY, QWEN_MODEL,
-    TEMPERATURE, MAX_TOKENS
+    TEMPERATURE, MAX_TOKENS,
 )
+from src.adapters.shared_http_session import get_shared_session
+from src.adapters.litellm_adapter import attempt_litellm_parsed_json
 
 # 尝试导入运行时配置（可选）
 try:
@@ -61,30 +62,27 @@ except ImportError:
         }
 
 
-def call_model(prompt: str, model_type: Optional[str] = None, total_deadline: Optional[float] = None, timeout: Optional[int] = None, temperature: Optional[float] = None, deadline_context=None) -> dict:
-    """调用模型生成内容，支持 Ollama、OpenAI 兼容 API（如 Qwen）
+def _per_request_http_timeout(attempt: int, request_timeout: Optional[int]) -> int:
+    """单次 HTTP ``requests`` 超时秒数：显式 ``timeout`` 优先；否则按重试阶梯 120 + attempt×60。"""
+    if request_timeout is not None:
+        return max(1, int(request_timeout))
+    return 120 + attempt * 60
 
-    支持运行时配置管理，可以通过runtime_config动态修改模型配置
+
+def call_model(
+    prompt: str,
+    model_type: Optional[str] = None,
+    total_deadline: Optional[float] = None,
+    timeout: Optional[int] = None,
+    temperature: Optional[float] = None,
+) -> dict:
+    """调用模型生成内容，支持 Ollama、OpenAI 兼容 API（如 Qwen）
 
     Args:
         total_deadline: Unix 时间戳（time.time()），超过该时间则抛出 TimeoutError
+        timeout: 单次 HTTP 请求超时秒数；不传时使用默认阶梯（首包 120s，每次重试 +60s）
     """
     import time as _time
-
-    # 处理deadline_context
-    if deadline_context:
-        try:
-            deadline_context.check_deadline()
-            # 使用deadline_context的剩余时间更新total_deadline
-            remaining = deadline_context.time_remaining()
-            if remaining is not None:
-                # 设置更严格的deadline，考虑网络请求时间
-                adjusted_deadline = _time.time() + remaining * 0.9  # 留出10%缓冲
-                if total_deadline is None or adjusted_deadline < total_deadline:
-                    total_deadline = adjusted_deadline
-        except Exception as e:
-            # 如果deadline_context已取消，抛出超时异常
-            raise TimeoutError(f"call_model: deadline_context检查失败: {e}")
 
     if total_deadline and _time.time() > total_deadline:
         raise TimeoutError("call_model: 已超过总时间限制")
@@ -94,13 +92,37 @@ def call_model(prompt: str, model_type: Optional[str] = None, total_deadline: Op
 
     try:
         if model_type == "ollama":
-            result = _call_ollama(prompt, model_type=model_type, total_deadline=total_deadline, temperature=temperature)
+            result = _call_ollama(
+                prompt,
+                model_type=model_type,
+                total_deadline=total_deadline,
+                temperature=temperature,
+                request_timeout=timeout,
+            )
         elif model_type == "openai":
-            result = _call_openai(prompt, model_type=model_type, total_deadline=total_deadline, temperature=temperature)
+            result = _call_openai(
+                prompt,
+                model_type=model_type,
+                total_deadline=total_deadline,
+                temperature=temperature,
+                request_timeout=timeout,
+            )
         elif model_type == "qwen":
-            result = _call_qwen(prompt, model_type=model_type, total_deadline=total_deadline, temperature=temperature)
+            result = _call_qwen(
+                prompt,
+                model_type=model_type,
+                total_deadline=total_deadline,
+                temperature=temperature,
+                request_timeout=timeout,
+            )
         elif model_type == "deepseek":
-            result = _call_deepseek(prompt, model_type=model_type, total_deadline=total_deadline, temperature=temperature)
+            result = _call_deepseek(
+                prompt,
+                model_type=model_type,
+                total_deadline=total_deadline,
+                temperature=temperature,
+                request_timeout=timeout,
+            )
         else:
             raise ValueError(f"不支持的模型类型: {model_type}")
 
@@ -141,7 +163,7 @@ def call_embedding(text: str) -> List[float]:
     json_str = json.dumps(payload, ensure_ascii=False)
     json_bytes = json_str.encode('utf-8')
 
-    resp = requests.post(EMBEDDING_URL, data=json_bytes, timeout=30)
+    resp = get_shared_session().post(EMBEDDING_URL, data=json_bytes, timeout=30)
     resp.raise_for_status()
     data = resp.json()
     embedding = data.get("embedding") or data.get("embeddings")
@@ -150,7 +172,13 @@ def call_embedding(text: str) -> List[float]:
     return embedding
 
 
-def _call_ollama(prompt: str, model_type: Optional[str] = None, total_deadline: Optional[float] = None, temperature: Optional[float] = None) -> dict:
+def _call_ollama(
+    prompt: str,
+    model_type: Optional[str] = None,
+    total_deadline: Optional[float] = None,
+    temperature: Optional[float] = None,
+    request_timeout: Optional[int] = None,
+) -> dict:
     """调用 Ollama 模型，强制使用 UTF-8 编码。
 
     不使用 format=json / 解析后二次请求：小模型在长表抽取时易被约束成更短输出，条数反而下降。
@@ -184,8 +212,8 @@ def _call_ollama(prompt: str, model_type: Optional[str] = None, total_deadline: 
         if total_deadline and _time.time() > total_deadline:
             raise TimeoutError("Ollama: 已超过总时间限制")
         try:
-            timeout = 120 + (attempt * 60)
-            resp = requests.post(config.get("url", OLLAMA_URL), data=json_bytes, timeout=timeout)
+            t_http = _per_request_http_timeout(attempt, request_timeout)
+            resp = get_shared_session().post(config.get("url", OLLAMA_URL), data=json_bytes, timeout=t_http)
             resp.raise_for_status()
             response_data = resp.json()
             result = (response_data.get("response") or "").strip()
@@ -199,7 +227,7 @@ def _call_ollama(prompt: str, model_type: Optional[str] = None, total_deadline: 
                 "Ollama调用超时，尝试 %s/%s，超时设置: %s秒",
                 attempt + 1,
                 max_retries,
-                timeout,
+                t_http,
             )
             last_exception = e
             if attempt < max_retries - 1:
@@ -210,7 +238,13 @@ def _call_ollama(prompt: str, model_type: Optional[str] = None, total_deadline: 
     raise Exception(f"Ollama调用失败，重试{max_retries}次后仍然超时: {last_exception}")
 
 
-def _call_openai(prompt: str, model_type: Optional[str] = None, total_deadline: Optional[float] = None, temperature: Optional[float] = None) -> dict:
+def _call_openai(
+    prompt: str,
+    model_type: Optional[str] = None,
+    total_deadline: Optional[float] = None,
+    temperature: Optional[float] = None,
+    request_timeout: Optional[int] = None,
+) -> dict:
     """调用 OpenAI 兼容 API（如本地部署的 Qwen），强制使用 UTF-8 编码"""
     import time as _time
     import json
@@ -250,11 +284,23 @@ def _call_openai(prompt: str, model_type: Optional[str] = None, total_deadline: 
         if total_deadline and _time.time() > total_deadline:
             raise TimeoutError("OpenAI: 已超过总时间限制")
         try:
-            # 每次重试增加超时时间：120, 180, 240秒
-            timeout = 120 + (attempt * 60)
+            t_http = _per_request_http_timeout(attempt, request_timeout)
             base_url = config.get("base_url", OPENAI_BASE_URL)
+            parsed_lm = attempt_litellm_parsed_json(
+                prompt,
+                model_type or "openai",
+                config,
+                t_http,
+                temperature,
+                "OpenAI 兼容",
+                _parse_model_response,
+            )
+            if parsed_lm is not None:
+                return parsed_lm
             # 使用 data 参数发送字节流，而非 json 参数
-            resp = requests.post(f"{base_url}/chat/completions", data=json_bytes, headers=headers, timeout=timeout)
+            resp = get_shared_session().post(
+                f"{base_url}/chat/completions", data=json_bytes, headers=headers, timeout=t_http
+            )
             resp.raise_for_status()
             response_data = resp.json()
             result = response_data["choices"][0]["message"]["content"].strip()
@@ -269,7 +315,7 @@ def _call_openai(prompt: str, model_type: Optional[str] = None, total_deadline: 
                 "OpenAI API调用超时，尝试 %s/%s，超时设置: %s秒",
                 attempt + 1,
                 max_retries,
-                timeout,
+                t_http,
             )
             last_exception = e
             if attempt < max_retries - 1:
@@ -282,13 +328,30 @@ def _call_openai(prompt: str, model_type: Optional[str] = None, total_deadline: 
     raise Exception(f"OpenAI API调用失败，重试{max_retries}次后仍然超时: {last_exception}")
 
 
-def _call_qwen(prompt: str, model_type: Optional[str] = None, total_deadline: Optional[float] = None, temperature: Optional[float] = None) -> dict:
+def _call_qwen(
+    prompt: str,
+    model_type: Optional[str] = None,
+    total_deadline: Optional[float] = None,
+    temperature: Optional[float] = None,
+    request_timeout: Optional[int] = None,
+) -> dict:
     """调用 Qwen 模型（兼容 OpenAI API）"""
-    # Qwen 通常使用 OpenAI 兼容接口，所以调用 openai 方法
-    return _call_openai(prompt, model_type or "qwen", total_deadline=total_deadline, temperature=temperature)
+    return _call_openai(
+        prompt,
+        model_type or "qwen",
+        total_deadline=total_deadline,
+        temperature=temperature,
+        request_timeout=request_timeout,
+    )
 
 
-def _call_deepseek(prompt: str, model_type: Optional[str] = None, total_deadline: Optional[float] = None, temperature: Optional[float] = None) -> dict:
+def _call_deepseek(
+    prompt: str,
+    model_type: Optional[str] = None,
+    total_deadline: Optional[float] = None,
+    temperature: Optional[float] = None,
+    request_timeout: Optional[int] = None,
+) -> dict:
     """调用 DeepSeek API，强制使用 UTF-8 编码"""
     import time as _time
     import json
@@ -328,14 +391,24 @@ def _call_deepseek(prompt: str, model_type: Optional[str] = None, total_deadline
         if total_deadline and _time.time() > total_deadline:
             raise TimeoutError("DeepSeek: 已超过总时间限制")
         try:
-            timeout = 120 + (attempt * 60)
+            t_http = _per_request_http_timeout(attempt, request_timeout)
             base_url = config.get("base_url", DEEPSEEK_BASE_URL)
-            # 使用 data 参数发送字节流，而非 json 参数
-            resp = requests.post(
+            parsed_lm = attempt_litellm_parsed_json(
+                prompt,
+                "deepseek",
+                config,
+                t_http,
+                temperature,
+                "DeepSeek",
+                _parse_model_response,
+            )
+            if parsed_lm is not None:
+                return parsed_lm
+            resp = get_shared_session().post(
                 f"{base_url}/chat/completions",
-                data=json_bytes,  # 关键修改：使用 data 而不是 json
+                data=json_bytes,
                 headers=headers,
-                timeout=timeout
+                timeout=t_http,
             )
             resp.raise_for_status()
             response_data = resp.json()
@@ -993,7 +1066,7 @@ class ModelGateway:
                     # 手动序列化 JSON，确保使用 UTF-8
                     json_str = json.dumps(payload, ensure_ascii=False)
                     json_bytes = json_str.encode('utf-8')
-                    resp = requests.post(url, data=json_bytes, timeout=5)
+                    resp = get_shared_session().post(url, data=json_bytes, timeout=5)
                     resp.raise_for_status()
                     status = "healthy"
                 else:

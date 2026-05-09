@@ -20,8 +20,8 @@ _READY_CACHE: Dict[str, Tuple[float, bool, str]] = {}
 
 
 def resolve_model_type(model_type: Optional[str] = None) -> str:
-    mt = (model_type or MODEL_TYPE or "ollama").strip().lower()
-    return mt or "ollama"
+    mt = (model_type or MODEL_TYPE or "deepseek").strip().lower()
+    return mt or "deepseek"
 
 
 def detect_model_readiness(

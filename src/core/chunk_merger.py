@@ -27,26 +27,6 @@ except ImportError:
     RAPIDFUZZ_AVAILABLE = False
     logger.warning("rapidfuzz 未安装，相似度合并功能将使用回退算法")
 
-# 可选依赖：sentence-transformers 用于语义相似度计算
-try:
-    from sentence_transformers import SentenceTransformer
-    import torch
-    SENTENCE_TRANSFORMERS_AVAILABLE = True
-    # 默认使用中文预训练模型，如果不可用则使用多语言模型
-    try:
-        # 尝试加载中文模型
-        SEMANTIC_MODEL = SentenceTransformer('paraphrase-multilingual-MiniLM-L12-v2')
-    except:
-        # 回退到通用模型
-        SEMANTIC_MODEL = SentenceTransformer('all-MiniLM-L6-v2')
-    logger.info(f"语义相似度模型已加载: {SEMANTIC_MODEL}")
-except ImportError:
-    SENTENCE_TRANSFORMERS_AVAILABLE = False
-    logger.warning("sentence-transformers 未安装，将使用字符串相似度")
-except Exception as e:
-    SENTENCE_TRANSFORMERS_AVAILABLE = False
-    logger.warning(f"语义相似度模型加载失败: {e}，将使用字符串相似度")
-
 
 @dataclass
 class MergeConfig:
@@ -104,6 +84,8 @@ class ChunkMerger:
         if not records:
             return records
 
+        user_supplied_key_fields = key_fields is not None
+
         # 1. 确定关键字段
         if key_fields is None:
             key_fields = self.detect_key_fields(records)
@@ -115,8 +97,8 @@ class ChunkMerger:
                 logger.debug(f"关键字段合并: {len(records)} -> {len(key_merged)} 条记录")
             records = key_merged
 
-        # 3. 基于相似度的二次合并（仅当仍有重复可能时）
-        if len(records) > 1 and RAPIDFUZZ_AVAILABLE:
+        # 3. 基于相似度的二次合并：调用方显式传入 key_fields 时不再叠加相似度（与键级合并口径一致）
+        if len(records) > 1 and RAPIDFUZZ_AVAILABLE and not user_supplied_key_fields:
             similarity_threshold = similarity_threshold or self.config.similarity_threshold
             similarity_merged = self._merge_by_similarity(records, similarity_threshold)
             if self.config.enable_debug and len(similarity_merged) < len(records):
@@ -257,7 +239,7 @@ class ChunkMerger:
     ) -> List[Dict[str, Any]]:
         """基于内容相似度的合并（无关键字段时使用）
 
-        优先使用嵌入模型计算语义相似度，其次使用 rapidfuzz 计算字符串相似度。
+        使用 rapidfuzz 计算字符串相似度。
         """
         if len(records) <= 1:
             return records
@@ -335,7 +317,7 @@ class ChunkMerger:
     def _compute_similarity_matrix(self, record_texts: List[Tuple[int, str]], threshold: float) -> List[List[float]]:
         """计算记录间的相似度矩阵
 
-        优先使用嵌入模型计算语义相似度，其次使用字符串相似度。
+        使用 rapidfuzz 计算字符串相似度，不依赖语义向量模型。
         """
         n = len(record_texts)
         texts = [text for _, text in record_texts]
@@ -343,43 +325,7 @@ class ChunkMerger:
         # 初始化相似度矩阵
         similarity_matrix = [[0.0] * n for _ in range(n)]
 
-        # 优先使用嵌入模型
-        if SENTENCE_TRANSFORMERS_AVAILABLE:
-            try:
-                # 批量编码所有文本
-                embeddings = SEMANTIC_MODEL.encode(texts, convert_to_tensor=True, show_progress_bar=False)
-
-                # 计算余弦相似度（不使用sklearn，使用numpy）
-                import numpy as np
-
-                # 将tensor转换为numpy数组
-                if hasattr(embeddings, 'cpu'):
-                    embeddings_np = embeddings.cpu().numpy()
-                else:
-                    embeddings_np = embeddings
-
-                # 归一化向量
-                norms = np.linalg.norm(embeddings_np, axis=1, keepdims=True)
-                norms[norms == 0] = 1e-10  # 避免除零
-                embeddings_norm = embeddings_np / norms
-
-                # 计算余弦相似度矩阵
-                cos_sim = np.dot(embeddings_norm, embeddings_norm.T)
-
-                # 填充相似度矩阵
-                for i in range(n):
-                    for j in range(i, n):
-                        similarity = float(cos_sim[i][j])
-                        similarity_matrix[i][j] = similarity
-                        similarity_matrix[j][i] = similarity
-
-                logger.debug(f"使用嵌入模型计算了 {n} 条记录的语义相似度矩阵")
-                return similarity_matrix
-
-            except Exception as e:
-                logger.warning(f"嵌入模型计算失败: {e}，回退到字符串相似度")
-
-        # 回退到字符串相似度
+        # 使用字符串相似度
         if RAPIDFUZZ_AVAILABLE:
             for i in range(n):
                 similarity_matrix[i][i] = 1.0  # 自相似度为1

@@ -10,7 +10,7 @@ Docling 文档解析器 - 唯一的文档解析入口
 
 import logging
 from pathlib import Path
-from typing import Dict, Any, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 import traceback
 
 try:
@@ -19,19 +19,19 @@ try:
 except ImportError:
     PANDAS_AVAILABLE = False
 
-try:
-    from docling.document_converter import DocumentConverter, PdfFormatOption
-    from docling.datamodel.base_models import InputFormat
-    from docling.datamodel.pipeline_options import (
-        PdfPipelineOptions,
-        EasyOcrOptions,
-        TesseractOcrOptions,
-    )
-    DOCLING_AVAILABLE = True
-except ImportError:
-    DOCLING_AVAILABLE = False
-
 from .base import BaseParser
+from src.core.chunk_sizing import adaptive_docling_paragraph_cap
+from src.adapters.docling_converter_pool import (
+    DOCLING_AVAILABLE,
+    get_shared_document_converter,
+    record_convert_for_rotation,
+)
+from src.adapters.docling_parse_cache import get_cached_parse, save_cached_parse
+from src.observability.prometheus_metrics import (
+    inc_docling_cache_hit,
+    inc_docling_cache_miss,
+    timed_convert,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -61,36 +61,6 @@ def _get_enable_ocr() -> bool:
 ENABLE_OCR = _get_enable_ocr()
 
 
-def _build_converter(enable_ocr: bool = False):
-    """构建 Docling DocumentConverter，支持 OCR 可选"""
-    if not DOCLING_AVAILABLE:
-        return None
-    try:
-        if enable_ocr:
-            pipeline_options = PdfPipelineOptions()
-            pipeline_options.do_ocr = True
-            pipeline_options.ocr_options = EasyOcrOptions(lang=["ch_sim", "en"])
-            pipeline_options.do_table_structure = True
-            pipeline_options.table_structure_options.do_cell_matching = True
-            return DocumentConverter(
-                format_options={InputFormat.PDF: PdfFormatOption(pipeline_options=pipeline_options)}
-            )
-        else:
-            pipeline_options = PdfPipelineOptions()
-            pipeline_options.do_ocr = False
-            pipeline_options.do_table_structure = True
-            pipeline_options.table_structure_options.do_cell_matching = True
-            return DocumentConverter(
-                format_options={InputFormat.PDF: PdfFormatOption(pipeline_options=pipeline_options)}
-            )
-    except Exception:
-        # 降级：使用默认配置
-        try:
-            return DocumentConverter()
-        except Exception:
-            return None
-
-
 class DoclingParser(BaseParser):
     """Docling 文档解析器 — 所有非纯文本格式的唯一解析入口"""
 
@@ -112,7 +82,7 @@ class DoclingParser(BaseParser):
                 "paragraphs": List[str],           # 段落列表
                 "tables": List[dict],              # 表格（含 markdown / dataframe）
                 "tables_dataframes": List[pd.DataFrame],  # 直接可用的 DataFrame
-                "chunks": List[dict],              # 语义分块（≤1500字）
+                "chunks": List[dict],              # 版式语义分块（段落合并上限随全文长度自适应）
                 "pages": int,
                 "warnings": List[str],
                 "error": str | None,
@@ -142,90 +112,101 @@ class DoclingParser(BaseParser):
             result["warnings"].append("Docling 库不可用")
             return result
 
+        cached = get_cached_parse(path, self.enable_ocr, self.parser_type)
+        if cached is not None:
+            inc_docling_cache_hit()
+            return cached
+
+        inc_docling_cache_miss()
         try:
-            converter = _build_converter(enable_ocr=self.enable_ocr)
+            converter = get_shared_document_converter(enable_ocr=self.enable_ocr)
             if converter is None:
                 result["error"] = "无法创建 Docling 转换器"
                 return result
 
             logger.info(f"Docling 解析: {path}")
-            conversion_result = converter.convert(str(path))
+            conversion_result = timed_convert(lambda: converter.convert(str(path)))
+            record_convert_for_rotation(self.enable_ocr)
             doc = conversion_result.document
 
             if doc is None:
                 result["warnings"].append("Docling 返回空文档")
                 return result
 
-            # ── 1. 按阅读顺序提取文本 ──────────────────────────────────────
-            text_parts = []
-            paragraphs = []
-            chunks = []
-            current_chunk_parts = []
-            current_chunk_len = 0
-            CHUNK_MAX = 1500
+            # ── 1. 按阅读顺序提取文本与分块 ─────────────────────────────────
+            text_parts: List[str] = []
+            paragraphs: List[str] = []
+            chunks: List[dict] = []
 
-            def _flush_chunk(label: str = "text"):
-                if current_chunk_parts:
-                    chunk_text = "\n".join(current_chunk_parts).strip()
-                    if chunk_text:
-                        chunks.append({"type": label, "text": chunk_text})
+            def _item_text_and_type(item) -> Tuple[str, str]:
+                item_type = type(item).__name__
+                item_text = ""
+                if hasattr(item, "text") and item.text:
+                    item_text = item.text.strip()
+                elif item_type in ("FormulaItem", "EquationItem") and hasattr(item, "export_to_latex"):
+                    try:
+                        item_text = item.export_to_latex().strip()
+                    except Exception:
+                        pass
+                if not item_text and hasattr(item, "export_to_markdown"):
+                    try:
+                        item_text = item.export_to_markdown().strip()
+                    except Exception:
+                        pass
+                return item_type, item_text
 
-            try:
-                for item, _ in doc.iterate_items():
-                    item_type = type(item).__name__
-                    item_text = ""
+            def _build_chunks_from_stream(stream: List[Tuple[str, str]], chunk_max: int) -> List[dict]:
+                out: List[dict] = []
+                current_chunk_parts: List[str] = []
+                current_chunk_len = 0
 
-                    if hasattr(item, "text") and item.text:
-                        item_text = item.text.strip()
-                    elif item_type in ("FormulaItem", "EquationItem") and hasattr(item, "export_to_latex"):
-                        try:
-                            item_text = item.export_to_latex().strip()
-                        except Exception:
-                            pass
-                    if not item_text and hasattr(item, "export_to_markdown"):
-                        try:
-                            item_text = item.export_to_markdown().strip()
-                        except Exception:
-                            pass
+                def _flush(label: str = "text"):
+                    if current_chunk_parts:
+                        chunk_text = "\n".join(current_chunk_parts).strip()
+                        if chunk_text:
+                            out.append({"type": label, "text": chunk_text})
 
-                    if not item_text:
-                        continue
-
-                    text_parts.append(item_text)
-
-                    # 段落/标题 → 合并进当前 chunk
+                for item_type, item_text in stream:
                     if item_type in ("TextItem", "SectionHeaderItem", "ParagraphItem"):
-                        paragraphs.append(item_text)
-                        if current_chunk_len + len(item_text) > CHUNK_MAX:
-                            _flush_chunk("text")
+                        if current_chunk_len + len(item_text) > chunk_max:
+                            _flush("text")
                             current_chunk_parts = [item_text]
                             current_chunk_len = len(item_text)
                         else:
                             current_chunk_parts.append(item_text)
                             current_chunk_len += len(item_text)
-
-                    # 表格 → 独立 chunk（类型标记为 table）
                     elif item_type == "TableItem":
-                        _flush_chunk("text")
+                        _flush("text")
                         current_chunk_parts = []
                         current_chunk_len = 0
-                        chunks.append({"type": "table", "text": item_text})
-
-                    # 公式 → 独立 chunk（类型标记为 formula，保留 LaTeX）
+                        out.append({"type": "table", "text": item_text})
                     elif item_type in ("FormulaItem", "EquationItem"):
-                        _flush_chunk("text")
+                        _flush("text")
                         current_chunk_parts = []
                         current_chunk_len = 0
-                        chunks.append({"type": "formula", "text": item_text})
-
-                    # 代码块 → 独立 chunk（类型标记为 code）
+                        out.append({"type": "formula", "text": item_text})
                     elif item_type in ("CodeItem", "ListingItem"):
-                        _flush_chunk("text")
+                        _flush("text")
                         current_chunk_parts = []
                         current_chunk_len = 0
-                        chunks.append({"type": "code", "text": item_text})
+                        out.append({"type": "code", "text": item_text})
+                _flush("text")
+                return out
 
-                _flush_chunk("text")
+            try:
+                stream: List[Tuple[str, str]] = []
+                for item, _ in doc.iterate_items():
+                    item_type, item_text = _item_text_and_type(item)
+                    if not item_text:
+                        continue
+                    stream.append((item_type, item_text))
+                    text_parts.append(item_text)
+                    if item_type in ("TextItem", "SectionHeaderItem", "ParagraphItem"):
+                        paragraphs.append(item_text)
+
+                approx_len = sum(len(t[1]) for t in stream)
+                chunk_max = adaptive_docling_paragraph_cap(approx_len)
+                chunks = _build_chunks_from_stream(stream, chunk_max)
 
             except Exception as e:
                 # iterate_items 不可用时降级
@@ -234,9 +215,9 @@ class DoclingParser(BaseParser):
                     md_text = doc.export_to_markdown()
                     text_parts = [md_text]
                     paragraphs = [p for p in md_text.split("\n") if p.strip()]
-                    # 简单分块
-                    for i in range(0, len(md_text), CHUNK_MAX):
-                        chunks.append({"type": "text", "text": md_text[i:i + CHUNK_MAX]})
+                    chunk_max = adaptive_docling_paragraph_cap(len(md_text))
+                    for i in range(0, len(md_text), chunk_max):
+                        chunks.append({"type": "text", "text": md_text[i : i + chunk_max]})
                 except Exception:
                     if hasattr(doc, "text") and doc.text:
                         text_parts = [doc.text]
@@ -277,6 +258,7 @@ class DoclingParser(BaseParser):
             except Exception:
                 pass
 
+            save_cached_parse(path, self.enable_ocr, result)
             logger.info(
                 f"Docling 解析完成: {path.name} | "
                 f"文本 {len(result['text'])} 字 | "

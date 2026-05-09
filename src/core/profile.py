@@ -7,13 +7,22 @@ import logging
 import os
 import re
 from pathlib import Path
-from typing import Optional, Dict, Any
+from typing import Any, Dict, List, Optional, Tuple
 
 from src.core.template_detector import detect_template_structure
-from src.core.alias import resolve_field_names
+from src.core.alias import load_alias_map, resolve_field_name
 from src.core.instruction_filters import parse_date_range_from_instruction
+from src.core.knowledge_data import load_json_array
+from src.config import DATE_FALLBACK_FIELD_NAME
 
 logger = logging.getLogger(__name__)
+
+
+def effective_instruction_text(instruction: Optional[str], profile: Any) -> str:
+    """显式传入的 instruction 优先；否则使用 profile 内默认说明（API `instruction`/侧文件 与模板内置文案对齐）。"""
+    if not isinstance(profile, dict):
+        return str(instruction or "").strip()
+    return (str(instruction or "").strip() or str(profile.get("instruction") or "").strip())
 
 
 # ── 字段类型自动推断 ────────────────────────────────────────────────────────
@@ -76,17 +85,45 @@ def _infer_field_type(field_name: str, unit: str = "") -> str:
     return "text"
 
 
+def _dedup_key_fields_for_table_profile(fields: List[dict]) -> List[str]:
+    """自左向右取连续 text 列作为复合去重键。
+
+    启发式：区分「行粒度」时，优先并列使用表头左侧若干 text 列，避免仅用单一粗粒度文本列作唯一键，以免合并阶段把多行压成一行导致数值与行错位。
+    """
+    text_prefix: List[str] = []
+    for f in fields:
+        if not isinstance(f, dict):
+            continue
+        if f.get("type") == "text":
+            n = str(f.get("name", "")).strip()
+            if n:
+                text_prefix.append(n)
+        else:
+            break
+    if len(text_prefix) >= 2:
+        keys = text_prefix
+    elif len(text_prefix) == 1:
+        keys = text_prefix
+    else:
+        keys = []
+    if keys:
+        ks = set(keys)
+        for f in fields:
+            if isinstance(f, dict) and f.get("name") in ks:
+                f["required"] = True
+    return keys
+
+
 def _enrich_fields(raw_fields: list, resolved_fields: list) -> tuple:
     """批量构建字段定义并自动推断关键字段
 
     Returns:
         (fields_list, dedup_key_fields)
-        关键字段识别策略：表格中第一个 text 类型字段视为去重 key。
+        去重键为表头左起连续 text 列（遇首个非 text 即停），见 `_dedup_key_fields_for_table_profile`。
     """
     _unit_re = re.compile(r'[（(]([^）)]{1,10})[）)]')
     fields = []
     seen_names = set()
-    first_text_field = None
 
     for raw, name in zip(raw_fields, resolved_fields):
         if name in seen_names:
@@ -103,18 +140,7 @@ def _enrich_fields(raw_fields: list, resolved_fields: list) -> tuple:
             f["unit"] = unit
         fields.append(f)
 
-        if first_text_field is None and field_type == "text":
-            first_text_field = name
-
-    # 关键字段启发式：第一个 text 字段作为 dedup key 并标记 required
-    dedup_key_fields = []
-    if first_text_field:
-        for f in fields:
-            if f["name"] == first_text_field:
-                f["required"] = True
-                dedup_key_fields.append(first_text_field)
-                break
-
+    dedup_key_fields = _dedup_key_fields_for_table_profile(fields)
     return fields, dedup_key_fields
 
 
@@ -122,14 +148,16 @@ def enrich_word_multi_table_specs(table_specs: list) -> None:
     """为每个 Word 表生成子 profile（table_profile）与内置抽取段落（builtin_prompt）。
 
     与表数量一一对应：几个表就有几个 table_profile 和几段 builtin_prompt。
+    列名以模板表头为准（仅 strip），不在此处做别名改写；与源表列对齐由抽取阶段完成。
     """
     for i, spec in enumerate(table_specs):
         if not isinstance(spec, dict):
             continue
-        raw = spec.get("field_names") or []
+        raw = [str(x).strip() for x in (spec.get("field_names") or []) if str(x).strip()]
         if not raw:
             continue
-        resolved = resolve_field_names(raw)
+        spec["field_names"] = raw
+        resolved = raw
         fields, dedup_key_fields = _enrich_fields(raw, resolved)
         idx = int(spec.get("table_index", i))
         above = (spec.get("instruction_above") or "").strip()
@@ -156,7 +184,7 @@ def enrich_word_multi_table_specs(table_specs: list) -> None:
             f"表上方说明：{above}" if above else "表上方说明：（无）",
             f"本表列名（JSON 字段名须与下列一致，全局为各表并集）：{json.dumps(resolved, ensure_ascii=False)}",
             f"本表字段类型：{json.dumps(type_hint, ensure_ascii=False)}",
-            "抽取时请结合本段说明理解该表语义；输出仍为全局 records，键为所有表列名并集，不适用的键填空字符串。",
+            "抽取时请结合本段说明理解该表语义；输出仍为全局 records；JSON 键必须与上列表头文字一致（不以别名字典改写列名），不适用的键填空字符串。",
         ]
         spec["builtin_prompt"] = "\n".join(lines)
 
@@ -196,8 +224,77 @@ def _extract_table_blocks(instruction: str) -> Dict[int, str]:
     return blocks
 
 
+def _parse_instruction_block_kv_lines(block: str) -> List[Tuple[str, str]]:
+    """解析表级说明块中的「标签：值」行（顺序保留）。"""
+    out: List[Tuple[str, str]] = []
+    for line in str(block).splitlines():
+        s = line.strip()
+        if not s:
+            continue
+        m = re.match(r"^(\S+)\s*[：:]\s*(.+)$", s)
+        if m:
+            out.append((m.group(1).strip(), m.group(2).strip()))
+    return out
+
+
+def _word_multi_merge_kv_block_into_spec(
+    spec: dict,
+    block: str,
+    alias_map: dict,
+    *,
+    merge_hints_into_existing: bool = False,
+) -> dict:
+    """将一段说明文字中的「标签：值」行合并进单条 ``table_spec``。
+
+    标签须能解析到本表 ``field_names`` 中的表头；**最后一组成功解析的标签：值**作为 ``filter_field`` / ``filter_value``（与历史行为一致）。``fixed_values`` 累积已解析键值。``instruction_extraction_hints`` 复述块内全部已解析行结构（供模型侧参考）。
+    """
+    sp = dict(spec)
+    block = str(block or "").strip()
+    if not block:
+        return sp
+    kv_pairs = _parse_instruction_block_kv_lines(block)
+    if not kv_pairs:
+        return sp
+    spec_headers = [str(x).strip() for x in (sp.get("field_names") or []) if str(x).strip()]
+    spec_field_names = set(spec_headers)
+    fixed = dict(sp.get("fixed_values") or {})
+    for label, val in kv_pairs:
+        label_s = (label or "").strip()
+        key = None
+        if label_s in spec_field_names:
+            key = label_s
+        else:
+            canon = resolve_field_name(label_s, alias_map)
+            if canon in spec_field_names:
+                key = canon
+        if key is None:
+            continue
+        fixed[key] = val
+        sp["filter_field"] = key
+        sp["filter_value"] = val
+    if fixed:
+        sp["fixed_values"] = fixed
+    if kv_pairs:
+        hint_body = "\n".join(
+            f"- {str(lab).strip()}：{str(va).strip()}" for lab, va in kv_pairs
+        )
+        prev = str(sp.get("instruction_extraction_hints") or "").strip()
+        if merge_hints_into_existing and prev:
+            sp["instruction_extraction_hints"] = prev + "\n" + hint_body
+        else:
+            sp["instruction_extraction_hints"] = hint_body
+    return sp
+
+
 def apply_word_multi_instruction_constraints(profile: dict, instruction: str) -> dict:
-    """把用户指令中的“分表约束”注入 table_specs（如城市/监测时间）。"""
+    """把多表 Word 的分表筛选约束写入 ``table_specs``。
+
+    优先级：**用户指令**中带 ``表1：`` / ``表2：`` 等分表块时，按块内「标签：值」行写入各表 ``filter_field`` / ``filter_value``（最后一组成功解析到本表表头的标签决定 filter，与历史一致）。
+
+    对仍缺少 filter 的表，使用模板检测阶段写入的 ``instruction_above``（该表在 Word 文档中**表格上方**的连续段落），按**相同**「标签：值」语法补全。适用于在模板版式内就近写分表条件、而不重复粘贴长指令的场景；不写具体业务词，仅复用通用解析规则。
+
+    标签须落在该表 ``field_names`` 内或经 ``field_aliases.json`` 归一后能命中表头；填表阶段仍按 ``filter_value`` 为字段值子串匹配（见 ``output_writer_orchestrator``）。
+    """
     if not isinstance(profile, dict):
         return profile
     if profile.get("template_mode") != "word_multi_table":
@@ -208,39 +305,25 @@ def apply_word_multi_instruction_constraints(profile: dict, instruction: str) ->
         return profile
 
     blocks = _extract_table_blocks(instruction or "")
-    if not blocks:
-        return profile
-
-    city_re = re.compile(r"城市\s*[：:]\s*([^\s，,；;。]+)")
-    time_re = re.compile(r"监测时间\s*[：:]\s*([^\n\r，,；;。]+)")
-    out_specs = []
+    alias_map = load_alias_map()
+    out_specs: List[Any] = []
     for i, spec in enumerate(specs):
         if not isinstance(spec, dict):
             out_specs.append(spec)
             continue
-        block = blocks.get(i, "")
-        if not block:
-            out_specs.append(spec)
-            continue
         sp = dict(spec)
-        fixed = dict(sp.get("fixed_values") or {})
-
-        city_m = city_re.search(block)
-        if city_m:
-            city = city_m.group(1).strip()
-            if city:
-                sp["filter_field"] = "城市"
-                sp["filter_value"] = city
-                fixed["城市"] = city
-
-        time_m = time_re.search(block)
-        if time_m:
-            mt = time_m.group(1).strip()
-            if mt:
-                fixed["监测时间"] = mt
-
-        if fixed:
-            sp["fixed_values"] = fixed
+        user_block = str(blocks.get(i, "") if blocks else "").strip()
+        if user_block:
+            sp = _word_multi_merge_kv_block_into_spec(sp, user_block, alias_map, merge_hints_into_existing=False)
+        ff = str(sp.get("filter_field") or "").strip()
+        fv = str(sp.get("filter_value") or "").strip()
+        if not (ff and fv):
+            above = str(sp.get("instruction_above") or "").strip()
+            if above:
+                merge_hints = bool(str(sp.get("instruction_extraction_hints") or "").strip())
+                sp = _word_multi_merge_kv_block_into_spec(
+                    sp, above, alias_map, merge_hints_into_existing=merge_hints
+                )
         out_specs.append(sp)
 
     out = dict(profile)
@@ -271,8 +354,18 @@ def apply_instruction_runtime_hints(profile: dict, instruction: str) -> dict:
     if not isinstance(fields, list):
         fields = []
     names = {str(f.get("name", "")).strip() for f in fields if isinstance(f, dict)}
-    if not any(n in names for n in ("日期", "统计日期", "监测时间", "时间", "date", "Date", "DATE")):
-        out["fields"] = list(fields) + [{"name": "日期", "type": "text"}]
+    signals = [str(x).strip() for x in load_json_array("date_field_signal_names.json") if str(x).strip()]
+
+    def _name_tokens_suggest_datetime(col: str) -> bool:
+        return bool(re.search(r"(date|time|timestamp)", str(col or ""), re.I))
+
+    if signals:
+        has_date_col = any(n in names for n in signals)
+    else:
+        has_date_col = any(_name_tokens_suggest_datetime(n) for n in names)
+    if not has_date_col:
+        fb = str(DATE_FALLBACK_FIELD_NAME or "date").strip() or "date"
+        out["fields"] = list(fields) + [{"name": fb, "type": "text"}]
     return out
 
 
@@ -285,19 +378,22 @@ def generate_profile_from_template(
     """从模板文件或自然语言描述生成 profile
 
     优先级：template_path（文件解析） > user_description（LLM） > 默认字段
+
+    自文件解析时：**列名以模板表头文字为准**（仅空白裁剪），不在 profile 层做 ``resolve_field_names`` 改写；
+    与源文档列名的对齐由抽取阶段（如 ``resolve_column``）完成。用户指令与内置提示均须与表头一致。
     """
     if mode in ("file", "auto") and template_path:
         try:
             detected = detect_template_structure(template_path)
             raw_fields = detected.pop("field_names", [])
-            resolved = resolve_field_names(raw_fields)
+            header_names = [str(x).strip() for x in raw_fields if str(x).strip()]
 
-            fields, dedup_key_fields = _enrich_fields(raw_fields, resolved)
+            fields, dedup_key_fields = _enrich_fields(header_names, header_names)
 
-            instruction = _default_instruction(detected.get("task_mode", "table_records"), resolved)
+            instruction = _default_instruction(detected.get("task_mode", "table_records"), header_names)
             if detected.get("template_mode") == "word_multi_table" and detected.get("table_specs"):
                 enrich_word_multi_table_specs(detected["table_specs"])
-                instruction = _default_instruction_word_multi(resolved, detected["table_specs"])
+                instruction = _default_instruction_word_multi(header_names, detected["table_specs"])
 
             profile = {
                 "report_name": Path(template_path).stem,
@@ -345,14 +441,19 @@ def generate_profile_smart(
 【用户指令】
 {instruction}{doc_part}
 
+【必须遵守的语义保留】（引导模型自行识别约束类型，勿省略）
+- 先分辨用户指令中的结构：分块、标签-值对、筛选/范围口径；再写进 "instruction"，禁止压缩成「按表提取」等无信息句。
+- 当行级限定无法映射到模板列名时，仍须在 "instruction" 中显式写出该限定；fields 只反映表头，不为此虚构列。
+- 字段名以模板为准；无法表头化的范围与过滤语义一律写在 "instruction"。
+
 输出JSON，必须包含：
 - "task_mode": "table_records" 或 "single_record"
 - "template_mode": "excel_table" / "word_table" / "vertical"
 - "fields": 字段数组，每个字段包含：
   - "name": 字段名（简洁明确）
   - "type": 字段类型，从以下选择：text（文本）、number（数值）、date（日期）、percentage（百分比/比率）、phone（电话号码）
-  - "unit": 单位（可选，如"亿元"、"万人"、"%"）
-- "instruction": 详细抽取说明
+  - "unit": 单位（可选；按文档中实际单位或符号填写）
+- "instruction": 详细抽取说明（须体现上述范围与筛选类约束）
 
 只输出JSON，不要其他文字："""
 
@@ -387,10 +488,10 @@ def _profile_from_llm(description: str, template_path: Optional[str]) -> dict:
         if isinstance(result, dict) and result.get("fields"):
             fields = result["fields"]
         else:
-            fields = [{"name": "字段1", "type": "text"}, {"name": "字段2", "type": "text"}]
+            fields = [{"name": "field_1", "type": "text"}, {"name": "field_2", "type": "text"}]
     except Exception as e:
         logger.warning(f"LLM 字段生成失败: {e}")
-        fields = [{"name": "字段1", "type": "text"}, {"name": "字段2", "type": "text"}]
+        fields = [{"name": "field_1", "type": "text"}, {"name": "field_2", "type": "text"}]
 
     # 二次推断：LLM 返回 text 类型的字段尝试用规则推断为更精确的类型
     enriched_fields = []
@@ -423,14 +524,14 @@ def _default_profile(template_path: Optional[str]) -> dict:
     return {
         "report_name": Path(template_path).stem if template_path else "default",
         "template_path": _rel_path(template_path) if template_path else "default",
-        "instruction": "从文档中提取关键信息",
+        "instruction": "Extract key fields from the document.",
         "task_mode": "single_record",
         "template_mode": "default",
         "fields": [
-            {"name": "名称", "type": "text"},
-            {"name": "数值", "type": "number"},
-            {"name": "单位", "type": "text"},
-            {"name": "备注", "type": "text"},
+            {"name": "name", "type": "text"},
+            {"name": "value", "type": "number"},
+            {"name": "unit", "type": "text"},
+            {"name": "note", "type": "text"},
         ],
     }
 
@@ -520,39 +621,34 @@ def generate_profile_from_document(
         # 默认假设为结构化单记录文档
         doc_type = "structured_single"
         task_mode = "single_record"
-        instruction = "从文档中提取关键信息"
+        instruction = "Extract key fields from the document."
 
-        # 简单启发式：如果字段数量多且包含常见表格字段，可能为表格
-        if len(fields_raw) > 8:
-            # 检查是否有典型表格字段
-            table_keywords = {"序号", "编号", "名称", "城市", "地区", "项目", "产品"}
-            field_names = [str(f.get("name", "")).lower() for f in fields_raw if isinstance(f, dict)]
-            if any(keyword in " ".join(field_names) for keyword in table_keywords):
-                doc_type = "structured_table"
-                task_mode = "table_records"
-                instruction = "从文档中逐条提取记录"
+        # 简单启发式：字段较多时按表格任务处理（不在逻辑中内置业务关键词）
+        if len(fields_raw) > 10:
+            doc_type = "structured_table"
+            task_mode = "table_records"
+            instruction = "Extract one record per source row or item."
 
         # QA 模式：返回最小化 profile + 标记
         if doc_type == "unstructured_qa":
             return {
                 "report_name": "auto_qa",
                 "template_path": "",
-                "instruction": instruction or "将文档内容存储为知识库，供智能问答使用",
+                "instruction": instruction or "Store document content for downstream Q&A.",
                 "task_mode": "single_record",
                 "template_mode": "generic",
                 "_doc_type": "unstructured_qa",
                 "fields": [
-                    {"name": "文档标题", "type": "text"},
-                    {"name": "摘要", "type": "text"},
-                    {"name": "关键词", "type": "text"},
-                    {"name": "主要内容", "type": "text"},
+                    {"name": "title", "type": "text"},
+                    {"name": "summary", "type": "text"},
+                    {"name": "keywords", "type": "text"},
+                    {"name": "body", "type": "text"},
                 ],
             }
 
         # 结构化模式：规范化字段
         fields = []
         seen = set()
-        first_text_field = None
         for f in fields_raw:
             if not isinstance(f, dict) or "name" not in f:
                 continue
@@ -569,17 +665,8 @@ def generate_profile_from_document(
             if unit:
                 entry["unit"] = unit
             fields.append(entry)
-            if first_text_field is None and declared_type == "text":
-                first_text_field = name
 
-        # 关键字段启发式：第一个 text 字段
-        dedup_key_fields = []
-        if first_text_field:
-            for f in fields:
-                if f["name"] == first_text_field:
-                    f["required"] = True
-                    dedup_key_fields.append(first_text_field)
-                    break
+        dedup_key_fields = _dedup_key_fields_for_table_profile(fields)
 
         if not fields:
             raise ValueError("LLM 未生成有效字段")
@@ -595,7 +682,7 @@ def generate_profile_from_document(
                 example_attrs = {}
             # 如果example_text为空但attributes有值，生成简单文本
             if not example_text and example_attrs:
-                example_text = "示例记录: " + ", ".join([f"{k}: {v}" for k, v in example_attrs.items()])
+                example_text = ", ".join([f"{k}: {v}" for k, v in example_attrs.items()])
 
         profile = {
             "report_name": "auto_generated",
@@ -636,32 +723,32 @@ def _heuristic_profile_from_text(text: str) -> dict:
         return {
             "report_name": "auto_generated",
             "template_path": "",
-            "instruction": "从文档中提取所有条目的关键信息，每个条目一条记录",
+            "instruction": "Extract one record per list or table row.",
             "task_mode": "table_records",
             "template_mode": "generic",
             "_doc_type": "structured_table",
             "fields": [
-                {"name": "序号", "type": "text"},
-                {"name": "名称", "type": "text"},
-                {"name": "描述", "type": "text"},
-                {"name": "数值", "type": "number"},
-                {"name": "备注", "type": "text"},
+                {"name": "col_1", "type": "text"},
+                {"name": "col_2", "type": "text"},
+                {"name": "col_3", "type": "text"},
+                {"name": "col_4", "type": "number"},
+                {"name": "col_5", "type": "text"},
             ],
         }
 
     return {
         "report_name": "auto_generated",
         "template_path": "",
-        "instruction": "从文档中提取关键信息",
+        "instruction": "Extract key fields from the document.",
         "task_mode": "single_record",
         "template_mode": "generic",
         "_doc_type": "structured_single",
         "fields": [
-            {"name": "标题", "type": "text"},
-            {"name": "主题", "type": "text"},
-            {"name": "关键信息", "type": "text"},
-            {"name": "数据摘要", "type": "text"},
-            {"name": "备注", "type": "text"},
+            {"name": "field_a", "type": "text"},
+            {"name": "field_b", "type": "text"},
+            {"name": "field_c", "type": "text"},
+            {"name": "field_d", "type": "text"},
+            {"name": "field_e", "type": "text"},
         ],
     }
 
@@ -708,7 +795,6 @@ def _normalize_profile(result: dict, template_path: Optional[str], instruction: 
     """标准化 LLM 返回的 profile，补充类型推断和关键字段识别"""
     fields = []
     seen = set()
-    first_text_field = None
     _unit_re = re.compile(r'[（(]([^）)]{1,10})[）)]')
     for f in result.get("fields", []):
         if not isinstance(f, dict) or "name" not in f:
@@ -732,17 +818,8 @@ def _normalize_profile(result: dict, template_path: Optional[str], instruction: 
         if f.get("required"):
             entry["required"] = True
         fields.append(entry)
-        if first_text_field is None and declared_type == "text":
-            first_text_field = name
 
-    # 关键字段启发式：第一个 text 字段
-    dedup_key_fields = []
-    if first_text_field:
-        for f in fields:
-            if f["name"] == first_text_field:
-                f["required"] = True
-                dedup_key_fields.append(first_text_field)
-                break
+    dedup_key_fields = _dedup_key_fields_for_table_profile(fields)
 
     profile = {
         "report_name": Path(template_path).stem if template_path else "auto",

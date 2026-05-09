@@ -108,13 +108,6 @@ def decide_word_multi_langextract_prefill(
     prof = _norm_profile(profile)
     text_chunks = _safe_text_chunks(chunks, max_chunks)
 
-    env = os.environ.get("A23_WORD_MULTI_LANGEXTRACT", "").strip().lower()
-    if env in ("0", "false", "no", "off"):
-        return False, "env_off"
-    if env in ("1", "true", "yes", "on"):
-        if not text_chunks:
-            return False, "env_on_no_text_chunks"
-        return True, "env_on"
     if prof.get("template_mode") != "word_multi_table":
         return False, "auto_not_word_multi"
     if not text_chunks:
@@ -247,6 +240,10 @@ def build_pipeline_routing_meta(
             stages.append("internal_structured_merge")
         stages.append("write_template")
 
+    scope_snap: Dict[str, Any] = {}
+    if routing_bundle and isinstance(routing_bundle.get("scope_resolution"), dict):
+        scope_snap = dict(routing_bundle["scope_resolution"])
+
     return {
         "schema_version": ROUTING_SCHEMA_VERSION,
         "template_mode": tm,
@@ -258,4 +255,5 @@ def build_pipeline_routing_meta(
         "post_internal_table_merge": bool(internal_post),
         "input": inp,
         "stages": stages,
+        "scope_resolution": scope_snap,
     }

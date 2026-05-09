@@ -7,7 +7,31 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## 项目概述
 企业内网AI文档处理系统，支持模板填表和文档问答。采用混合策略（规则预抽取+AI模型验证）实现文档结构化提取。
 
-**上线形态**：以 **`api_server`（FastAPI）** 与 `src/api/*` 为生产主路径；`main.py` 与 `scripts/` 用于调试、批测与异步任务子进程。抽取路由摘要见 `src/core/extraction_routing.py`（返回 `metadata.pipeline_routing`），详见 `docs/DEPLOYMENT.md`。
+**上线形态**：以 **`api_server`（FastAPI）** 为入口，路由在 `src/api/routes/*`；**正式对接以同步** `POST /api/extract/direct` **为主**（业务异步由后端队列 + worker 调算法）。可选 `src/api/task_manager.py`（`/api/tasks/*`）默认 **`A23_ENABLE_TASKS=false`** 关闭，仅本地/无队列长任务联调时开启。`main.py` 与 `scripts/` 用于调试、批测。对接分工见 **`HTTP_API_USAGE.md`** 篇首。抽取路由摘要见 `src/core/extraction_routing.py`（`metadata.pipeline_routing`），详见 `docs/DEPLOYMENT.md`。
+
+以下 **硬约束** 为仓库级契约，**改代码前必读**；违反任一条的 PR 应拒绝合并。
+
+## 变更与逻辑（硬约束）
+
+- **最小修改、禁止赠填**：改动须严格落在需求范围内；**禁止**借机向主路径塞进大量**原本不存在**的分支、隐式策略与「顺便加上的聪明逻辑」。每增加一条行为，都须有通用产品或工程理由，否则视为赠填。
+- **禁止依赖回退链**：**不**把「先试 A，不行再 B、再 C」当作默认架构；**不**以层层 fallback 替代对问题的一次性、直接解法。能力缺失或环境差异应通过**显式**配置、能力探测、边界文档或失败语义表达，而不是把回退堆成主流程。
+- **必须泛化**：任何改进必须适用于**一类**任务与数据形态；**禁止**为当前某个样例文件、单次任务、某一地区或业务写特判、魔法常量或专用分支。特判堆积将不可维护，评审须拦截。
+- **直接做对**：优先在正确抽象上**一次**实现预期行为；若存在历史兼容路径，应计划收敛而非无限叠加平行逻辑。
+
+## 文件处理边界（硬约束）
+
+在「扫描 → 解析 → 抽取 → 模板填写」全链路中：
+
+- **不得**为单次任务把具体文件正文、监测值、地名等写进代码或配置当硬编码业务规则；列名归一、类型推断等须保持**通用**（见 `src/knowledge/*.json`）。
+- **不得**默认再产出依赖文件侧大段原文或逐行重复的附属物（例如与 `*_result.json` 重复的全量调试行、RAG 片段预览等）。`main.py` 默认**不写** `*_result_report.json`；调试时设 `A23_WRITE_RESULT_REPORT_BUNDLE=true`。
+- 对外契约输出以产品约定为准（如填好的模板、`records` 结构化结果）；其余仅允许指标级元数据（耗时、条数、路由摘要等），避免「第二份全文」。
+- Word 多表在**未**使用抽取阶段已给出的 `_table_groups` 时，`table_specs` 的 `filter_value` 仅与单元格值做**显式子串包含**判断；**不得**在填表分组里再对具体文件内容做向量相似度、模糊分或地名启发式。分表语义应由**指令与源列措辞一致**、或由上一步抽取（含并行多表路径）产出结构化分组保证。
+
+## 工程与注释（硬约束）
+
+- **注释与文档字符串**须写成**成熟定稿**：直接描述当前行为、契约、前置条件与不变量；**禁止**渐进式叙述（例如「先…再…」「第一步」「暂」「简化版」「占位」「回头再改」）和面向过程的讲义体。
+- 模块/文件头注释若存在，应概括职责与对外边界，与实现一致；**禁止**把注释当作迭代笔记或待办口吻。
+- 日志文案与 **logger** 面向运维与排障，同样采用定稿式陈述；**避免**「回退到」等暗示未完成的措辞，改为「改用」「输出为空时」等明确因果。
 
 ## 技术栈
 - Python 3.11+, FastAPI, Ollama
@@ -17,7 +41,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - **缓存与监控**：diskcache（持久化缓存）, prometheus-client（指标监控）
 - **OCR支持**：Tesseract, Pillow, opencv-python, pdf2image
 - **数据库**：pymysql（MySQL入库）
-- **可选RAG集成**：langchain, langchain-community, chromadb（自动降级到手写RAG）
+- **文档问答（HTTP）**：默认 **LangChain** + **Chroma** + **HuggingFaceEmbeddings**，回退 **`rank-bm25` + `sentence-transformers`**（`qna_retrieval`）；生成答案默认 **`A23_QNA_MODEL_TYPE=deepseek`**（与抽取 **`A23_MODEL_TYPE`** 独立）；句向量默认离线优先 **`models/qna_embedding`**（不设 **`A23_QNA_SENTENCE_TRANSFORMER`** 且不下载快照时不访问 Hub）。**浏览器跨域**：`api_server` 已配置 CORS（默认列表 + 私网/localhost 正则，见 **`HTTP_API_USAGE.md`**）。**CLI 抽取链路**可选 RAG 结构化输入（与 `main.py` 参数相关）
 - **认证**：python-jose, passlib
 
 ## 常用命令
@@ -36,23 +60,21 @@ pip install -r requirements.txt
 # 新架构依赖（已包含在requirements.txt中）
 # - docling>=2.0.0: 文档语义分块与解析
 # - langextract>=0.1.0: 语言提取工具
-# - sentence-transformers>=2.2.0: 语义相似度计算（可选）
+# - sentence-transformers（锁定版本见 requirements.txt）：问答句向量与检索
 # - diskcache>=5.6.3: 持久化缓存
 # - prometheus-client>=0.20.0: 监控指标
 # - pymysql>=1.1.0: MySQL数据库支持
 
-# 可选RAG集成（LangChain，需单独安装）
-pip install langchain langchain-community chromadb
-# 安装后，qna_service.py将自动切换到LangChain ConversationalRetrievalChain
+# 问答依赖自检（BM25 + sentence-transformers，已含于 requirements.txt）
+python scripts/verify_qna_deps.py
 
 # OCR系统依赖（需要单独安装）
 # 1. Tesseract OCR: https://github.com/UB-Mannheim/tesseract/wiki
 # 2. Poppler工具（PDF转图像）: https://github.com/oschwartz10612/poppler-windows
 
-# 模型准备（选择一种）
-# 1. Ollama本地模型: ollama pull qwen2.5:7b
-# 2. DeepSeek云API: 配置 .env 中的 A23_DEEPSEEK_API_KEY
-# 3. OpenAI兼容API: 配置本地Qwen服务地址
+# 模型准备（默认与本地测试）
+# 默认 MODEL_TYPE=deepseek：复制 .env.example 为 .env，填写 A23_DEEPSEEK_API_KEY 即可。
+# 备选：Ollama 本地 ollama pull qwen2.5:7b 后设 A23_MODEL_TYPE=ollama；或其它 OpenAI 兼容端点。
 ```
 
 ### 运行系统
@@ -155,7 +177,7 @@ A23_ENABLE_OCR=false
 - `A23_MODEL_TYPE`: 模型类型，可选 `deepseek`、`ollama`、`openai`、`qwen`
 - `A23_DEEPSEEK_API_KEY`: DeepSeek API密钥（当使用DeepSeek时）
 - `A23_OLLAMA_MODEL`: Ollama模型名称，如 `qwen2.5:7b`
-- `A23_TARGET_LIMIT_SECONDS`: 单次模型调用超时时间（秒）
+- `A23_TARGET_LIMIT_SECONDS`: 运行观测/目标耗时参考（秒），**不**直接截断单次 HTTP 请求
 - `A23_FUZZY_THRESHOLD`: 字段别名模糊匹配阈值（0-100，默认75）
 - `A23_NORMALIZATION_CONFIG`: 字段归一化规则配置文件路径
 - `A23_ENABLE_OCR`: 是否启用OCR功能（true/false）
@@ -169,7 +191,7 @@ A23_ENABLE_OCR=false
 2. **API 编排层**:
    - `src/api/direct_extractor.py` - 同步抽取编排
    - `src/api/task_manager.py` - 异步任务管理与子进程执行
-   - `src/api/qna_service.py` - 文档问答服务
+   - `src/api/qna_service.py` - 文档问答编排；`src/api/qna_langchain.py` - LangChain 默认路径；`src/api/qna_retrieval.py` - 混合检索回退
 3. **核心抽取层（src/core）**:
    - `extraction_service.py` - 抽取主链路（切片、模型调用、合并）
    - `extraction_routing.py` - 抽取路由元数据（`pipeline_routing`）
@@ -198,7 +220,7 @@ A23_ENABLE_OCR=false
 
 ### 模型集成策略
 - **统一接口**: `call_model()` 支持多种后端（Ollama/OpenAI/Qwen/DeepSeek）
-- **超时重试**: 120秒基础超时，最多3次重试，支持`total_deadline`总超时控制
+- **超时重试**: 单次 HTTP 默认首包 120s，重试阶梯每次 +60s，最多 3 次；`call_model(..., timeout=秒)` 覆盖单次 HTTP 超时；另支持 `total_deadline`（Unix 时间）总截止时间
 - **混合抽取**: 规则预抽取提供确定性，AI模型提供语义理解
 - **三级回退**: AI本地模型 → API云模型 → 纯规则抽取
 - **语义分块优先**: 优先使用Docling语义分块，保持文档结构完整性
@@ -232,7 +254,7 @@ A23_ENABLE_OCR=false
 - **总超时控制**: `--total-timeout`参数和`total_deadline`机制，防止无限等待
 - **持久化存储**: API上传文件保存到`storage/uploads/`，支持任务重启恢复
 - **任务状态管理**: 任务状态持久化，日志文件可通过API查询
-- **优雅降级**: LangChain集成可选，失败时自动降级到手写RAG
+- **文档问答**: 默认 LangChain 对话检索链；失败或 `A23_QNA_USE_LANGCHAIN=false` 时走 `qna_retrieval`；可选 `A23_QNA_PERSIST_SESSION=false` 由业务库存会话
 
 ### 4. 参数体系优化
 - **`--llm-mode`参数**: 替代旧的`--use-rules-only`和`--use-unit-aware`
@@ -257,7 +279,7 @@ A23_ENABLE_OCR=false
 1. 所有新增功能必须先写测试（测试文件在 `tests/` 目录）
 2. 修改API接口必须更新 `HTTP_API_USAGE.md`
 3. 新增依赖必须在 `requirements.txt` 中明确版本
-4. 模型调用超时设为120秒，失败有重试机制（见 `model_client.py`）
+4. 模型 HTTP 超时默认见 `model_client.py`（阶梯重试）；调用方可传 `timeout`；失败自动重试（最多 3 次）
 5. 不要直接修改生产配置，通过环境变量（`.env`）覆盖
 6. 维护知识库一致性：修改字段逻辑时更新 `src/knowledge/field_aliases.json`
 7. 保持向后兼容性：新增功能不应破坏现有模板填表流程

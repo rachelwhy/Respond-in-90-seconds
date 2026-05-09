@@ -1,6 +1,5 @@
 import json
 import re
-import os
 import logging
 from collections import Counter
 from decimal import Decimal, ROUND_HALF_UP
@@ -9,16 +8,12 @@ from typing import Any, Dict, List
 
 from src.adapters.model_client import call_model, call_ollama
 from src.core.field_interpreter import FieldInterpreter
+from src.core.debug_flags import is_debug_enabled
+from src.core.knowledge_data import load_json_array
 
 logger = logging.getLogger(__name__)
 
-
-def _is_debug_enabled() -> bool:
-    v = os.environ.get("A23_DEBUG")
-    return str(v).strip().lower() in ("1", "true", "yes", "on", "y")
-
-
-_DEBUG = _is_debug_enabled()
+_DEBUG = is_debug_enabled()
 _FIELD_INTERPRETER = FieldInterpreter()
 
 
@@ -303,10 +298,8 @@ def rule_fill_table_records(extracted_raw: dict, profile: dict):
 
     fill_log = []
 
-    # 你可以按字段名分组，哪些字段适合继承上一行
-    carry_forward_fields = {
-        "城市", "城市名", "区", "区域", "省份"
-    }
+    # 启发式：适合向上继承的列名来自 src/knowledge/carry_forward_field_names.json（默认可为空）
+    carry_forward_fields = {str(x).strip() for x in load_json_array("carry_forward_field_names.json") if str(x).strip()}
 
     previous_row = {}
 
@@ -516,7 +509,11 @@ def retry_missing_required_fields_single(
     if not field_items:
         return extracted_raw, retried
 
-    retry_prompt = build_missing_fields_prompt(text, field_items)
+    retry_names = [str(item.get("name")) for item in field_items if isinstance(item, dict) and item.get("name")]
+    if not retry_names:
+        return extracted_raw, retried
+
+    retry_prompt = build_missing_fields_prompt(text, retry_names)
 
     try:
         retry_result = call_model(retry_prompt)
@@ -780,8 +777,8 @@ def process_single_record(extracted_raw, profile):
 def _flatten_nested_records(raw_records: list, field_names: list) -> list:
     """将 LLM 返回的嵌套 JSON 展平为扁平记录列表。
 
-    处理场景：LLM 返回 {"头部城市": {"北京": {"GDP": 123, ...}}} 这样的嵌套结构，
-    需要展平为 [{"城市": "北京", "GDP总量": "123", ...}, ...] 的扁平记录。
+    典型场景：对象树外层键表示分组或实体标识，内层为字段；需展平为行记录。
+    启发式：将父级键写入首列或首个空文本字段，使每条叶子记录在键空间上可区分。
     """
     if not raw_records:
         return raw_records
@@ -807,7 +804,7 @@ def _flatten_nested_records(raw_records: list, field_names: list) -> list:
         if _is_flat_record(obj):
             rec = dict(obj)
             if parent_key:
-                # 尝试把父级 key 作为第一个文本字段的值（通常是"城市"之类的名称）
+                # 尝试把父级 key 写入首列或首个空文本字段（实体名/分组名类）
                 text_fields = [f for f in field_names if f not in rec or not rec[f]]
                 first_text = field_names[0] if field_names else None
                 if first_text and (first_text not in rec or not rec[first_text]):
@@ -815,7 +812,7 @@ def _flatten_nested_records(raw_records: list, field_names: list) -> list:
             flat_records.append(rec)
             return
 
-        # 当前层的所有 value 都是 dict → 分组层，key 可能是名称（如城市名）
+        # 当前层 value 均为 dict → 分组层，子树的 key 多为下一层实体标识
         dict_values = {k: v for k, v in obj.items() if isinstance(v, dict)}
         if dict_values:
             for key, val in dict_values.items():
@@ -1015,7 +1012,7 @@ def _apply_filter_rules(records: list, filter_rules: list) -> list:
     filter_rules 格式示例：
     [
       {"field": "金额", "op": ">",        "value": 10000},
-      {"field": "城市", "op": "contains", "value": "京"},
+      {"field": "地区", "op": "contains", "value": "京"},
       {"field": "日期", "op": ">=",       "value": "2025-01-01"}
     ]
 
@@ -1101,13 +1098,14 @@ def process_by_profile(extracted_raw: dict, profile: dict):
                     return sv
             return ""
 
-        # 默认按“城市/名称”在原文首次出现的位置排序（稳定）
-        # 如果 profile 明确给了 key_fields，则优先用其第一个字段名
+        # 稳定排序：按「锚点字符串」在原文中首次出现位置；优先使用 profile 的 dedup_key，再回退到若干短文本列名模式
         key_fields = profile.get("dedup_key_fields") or profile.get("key_fields") or []
         candidates = []
         if isinstance(key_fields, list) and key_fields:
             candidates.extend([str(x) for x in key_fields if x])
-        candidates.extend(["城市", "城市名", "名称", "公司", "单位"])
+        candidates.extend(
+            [str(x).strip() for x in load_json_array("source_order_anchor_fieldnames.json") if str(x).strip()]
+        )
 
         indexed = []
         for idx, rec in enumerate(records):

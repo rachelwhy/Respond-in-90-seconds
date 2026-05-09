@@ -448,14 +448,3 @@ class UniversalExtractor:
                 fill_excel_table(records, template_path, output_path)
             else:
                 fill_excel_vertical(records[0], template_path, output_path)
-
-
-# ── 全局实例（向后兼容） ─────────────────────────────────────────────────────
-_global_extractor: Optional[UniversalExtractor] = None
-
-
-def get_global_extractor() -> UniversalExtractor:
-    global _global_extractor
-    if _global_extractor is None:
-        _global_extractor = UniversalExtractor()
-    return _global_extractor

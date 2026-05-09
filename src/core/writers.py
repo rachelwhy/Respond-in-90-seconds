@@ -1,6 +1,33 @@
+import re
 from copy import copy
+from pathlib import Path
+from typing import Optional
+
 from openpyxl import load_workbook
 from docx import Document
+
+
+def sanitize_template_stem_for_output(stem: str) -> str:
+    """将模板路径片段整理为输出文件名安全 stem（与 CLI/API 落盘命名约定一致）。"""
+    s = (stem or "").strip()
+    if not s:
+        return "output"
+    s = re.sub(r"[/\\]+", "_", s)
+    s = re.sub(r"\s+", "_", s)
+    s = re.sub(r"[^\w\-.]+", "_", s).strip("_")
+    return s if s else "output"
+
+
+def build_default_extracted_filename(template_path: Optional[str], ext: str, ts: int) -> str:
+    """默认抽取产物文件名：``{stem}_Doc90_{timestamp}{ext}``。"""
+    e = str(ext or ".xlsx").strip()
+    if not e.startswith("."):
+        e = "." + e
+    if template_path:
+        stem = sanitize_template_stem_for_output(Path(str(template_path)).stem)
+    else:
+        stem = "output"
+    return f"{stem}_Doc90_{int(ts)}{e}"
 
 
 def _normalize_records(records):

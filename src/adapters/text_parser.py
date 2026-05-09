@@ -2,6 +2,7 @@ from pathlib import Path
 from typing import Any, Dict, List
 
 from src.adapters.base import BaseParser
+from src.core.chunk_sizing import adaptive_docling_paragraph_cap
 
 
 def safe_read_text(path: Path) -> str:
@@ -24,11 +25,11 @@ class TextParser(BaseParser):
         chunks = []
         current_chunk = []
         current_len = 0
-        CHUNK_MAX = 1500
+        chunk_max = adaptive_docling_paragraph_cap(len(text))
 
         for para in paragraphs:
             para_len = len(para)
-            if current_len + para_len > CHUNK_MAX and current_chunk:
+            if current_len + para_len > chunk_max and current_chunk:
                 chunks.append({"type": "text", "text": "\n".join(current_chunk)})
                 current_chunk = [para]
                 current_len = para_len

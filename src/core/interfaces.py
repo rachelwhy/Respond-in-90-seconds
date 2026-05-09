@@ -8,6 +8,8 @@
 from abc import ABC, abstractmethod
 from typing import List, Dict, Any, Optional
 
+from src.config import EXTRACTION_TIMEOUT
+
 
 class IExtractionService(ABC):
     """抽取服务统一接口"""
@@ -15,10 +17,10 @@ class IExtractionService(ABC):
     @abstractmethod
     def extract_from_text(self, text: str, profile: dict,
                           llm_mode: str = "full",
-                          slice_size: int = 2000,
+                          slice_size: Optional[int] = None,
                           overlap: int = 100,
                           max_chunks: int = 50,
-                          time_budget: int = 110,
+                          time_budget: int = EXTRACTION_TIMEOUT,
                           quiet: bool = False) -> Dict[str, Any]:
         """从文本中提取结构化信息
 
@@ -59,10 +61,10 @@ class IExtractionService(ABC):
     @abstractmethod
     def extract_with_slicing(self, text: str, profile: dict,
                              use_model: bool = True,
-                             slice_size: int = 2000,
+                             slice_size: Optional[int] = None,
                              overlap: int = 100,
                              show_progress: bool = True,
-                             time_budget: int = 110,
+                             time_budget: int = EXTRACTION_TIMEOUT,
                              chunks: list = None,
                              max_chunks: int = 50,
                              logger=None,
@@ -95,74 +97,3 @@ class IExtractionService(ABC):
     def merge_records_by_key(self, records: List[Dict], key_fields: Optional[List[str]] = None) -> List[Dict]:
         """基于关键字段的记录融合去重"""
         pass
-
-
-class IParserService(ABC):
-    """解析服务统一接口"""
-
-    @abstractmethod
-    def parse_document(self, document_path: str) -> Dict[str, Any]:
-        """解析文档，返回结构化的文档信息
-
-        Args:
-            document_path: 文档文件路径
-
-        Returns:
-            文档信息字典，包含text、chunks、tables等字段
-        """
-        pass
-
-    @abstractmethod
-    def parse_text(self, text: str, file_extension: str = ".txt") -> Dict[str, Any]:
-        """解析文本，返回结构化的文档信息
-
-        Args:
-            text: 原始文本
-            file_extension: 文件扩展名，用于推断文档类型
-
-        Returns:
-            文档信息字典
-        """
-        pass
-
-    @abstractmethod
-    def get_semantic_chunks(self, document_path: str, max_chunks: int = 50) -> List[Dict[str, Any]]:
-        """获取文档的语义分块
-
-        Args:
-            document_path: 文档文件路径
-            max_chunks: 最大分块数
-
-        Returns:
-            语义分块列表，每个分块包含type、text等字段
-        """
-        pass
-
-
-# 工厂函数和注册表
-_extraction_service_registry = {}
-_parser_service_registry = {}
-
-
-def register_extraction_service(name: str, service_class):
-    """注册抽取服务实现"""
-    _extraction_service_registry[name] = service_class
-
-
-def get_extraction_service(name: str = "default", **kwargs) -> IExtractionService:
-    """获取抽取服务实例"""
-    if name not in _extraction_service_registry:
-        raise ValueError(f"未注册的抽取服务: {name}")
-    return _extraction_service_registry[name](**kwargs)
-
-
-def register_parser_service(name: str, service_class):
-    """注册解析服务实现"""
-    _parser_service_registry[name] = service_class
-
-
-def get_parser_service(name: str = "default", **kwargs) -> IParserService:
-    """获取解析服务实例"""
-    if name not in _parser_service_registry:
-        raise ValueError(f"未注册的解析服务: {name}")
-    return _parser_service_registry[name](**kwargs)
