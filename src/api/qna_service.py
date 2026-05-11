@@ -364,7 +364,7 @@ def answer_question(
                 f"文档片段：\n{context}\n\n"
                 f"请给出准确、简洁的回答："
             )
-            answer = call_model(prompt, model_type=effective_model_type)
+            answer = call_model(prompt, model_type=effective_model_type, plain_text=True)
             if isinstance(answer, dict):
                 answer = answer.get("answer") or str(answer)
         except Exception as e:

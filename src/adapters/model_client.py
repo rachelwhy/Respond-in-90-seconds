@@ -75,12 +75,15 @@ def call_model(
     total_deadline: Optional[float] = None,
     timeout: Optional[int] = None,
     temperature: Optional[float] = None,
+    *,
+    plain_text: bool = False,
 ) -> dict:
     """调用模型生成内容，支持 Ollama、OpenAI 兼容 API（如 Qwen）
 
     Args:
         total_deadline: Unix 时间戳（time.time()），超过该时间则抛出 TimeoutError
         timeout: 单次 HTTP 请求超时秒数；不传时使用默认阶梯（首包 120s，每次重试 +60s）
+        plain_text: 为 True 时假定模型返回自然语言（问答等），不做多阶段 JSON 解析，返回 ``{\"answer\": ...}``。
     """
     import time as _time
 
@@ -98,6 +101,7 @@ def call_model(
                 total_deadline=total_deadline,
                 temperature=temperature,
                 request_timeout=timeout,
+                plain_text=plain_text,
             )
         elif model_type == "openai":
             result = _call_openai(
@@ -106,6 +110,7 @@ def call_model(
                 total_deadline=total_deadline,
                 temperature=temperature,
                 request_timeout=timeout,
+                plain_text=plain_text,
             )
         elif model_type == "qwen":
             result = _call_qwen(
@@ -114,6 +119,7 @@ def call_model(
                 total_deadline=total_deadline,
                 temperature=temperature,
                 request_timeout=timeout,
+                plain_text=plain_text,
             )
         elif model_type == "deepseek":
             result = _call_deepseek(
@@ -122,6 +128,7 @@ def call_model(
                 total_deadline=total_deadline,
                 temperature=temperature,
                 request_timeout=timeout,
+                plain_text=plain_text,
             )
         else:
             raise ValueError(f"不支持的模型类型: {model_type}")
@@ -178,6 +185,8 @@ def _call_ollama(
     total_deadline: Optional[float] = None,
     temperature: Optional[float] = None,
     request_timeout: Optional[int] = None,
+    *,
+    plain_text: bool = False,
 ) -> dict:
     """调用 Ollama 模型，强制使用 UTF-8 编码。
 
@@ -218,7 +227,7 @@ def _call_ollama(
             response_data = resp.json()
             result = (response_data.get("response") or "").strip()
             logging.getLogger(__name__).debug("Ollama原始响应长度: %s", len(result))
-            parsed = _parse_model_response(result)
+            parsed = _response_text_to_dict(result, plain_text=plain_text)
             logging.getLogger(__name__).debug("Ollama解析后结果类型: %s", type(parsed).__name__)
             return parsed
 
@@ -244,6 +253,8 @@ def _call_openai(
     total_deadline: Optional[float] = None,
     temperature: Optional[float] = None,
     request_timeout: Optional[int] = None,
+    *,
+    plain_text: bool = False,
 ) -> dict:
     """调用 OpenAI 兼容 API（如本地部署的 Qwen），强制使用 UTF-8 编码"""
     import time as _time
@@ -286,15 +297,17 @@ def _call_openai(
         try:
             t_http = _per_request_http_timeout(attempt, request_timeout)
             base_url = config.get("base_url", OPENAI_BASE_URL)
-            parsed_lm = attempt_litellm_parsed_json(
-                prompt,
-                model_type or "openai",
-                config,
-                t_http,
-                temperature,
-                "OpenAI 兼容",
-                _parse_model_response,
-            )
+            parsed_lm = None
+            if not plain_text:
+                parsed_lm = attempt_litellm_parsed_json(
+                    prompt,
+                    model_type or "openai",
+                    config,
+                    t_http,
+                    temperature,
+                    "OpenAI 兼容",
+                    _parse_model_response,
+                )
             if parsed_lm is not None:
                 return parsed_lm
             # 使用 data 参数发送字节流，而非 json 参数
@@ -306,7 +319,7 @@ def _call_openai(
             result = response_data["choices"][0]["message"]["content"].strip()
             logging.getLogger(__name__).debug("OpenAI原始响应长度: %s", len(result))
 
-            parsed = _parse_model_response(result)
+            parsed = _response_text_to_dict(result, plain_text=plain_text)
             logging.getLogger(__name__).debug("OpenAI解析后结果类型: %s", type(parsed).__name__)
             return parsed
 
@@ -334,6 +347,8 @@ def _call_qwen(
     total_deadline: Optional[float] = None,
     temperature: Optional[float] = None,
     request_timeout: Optional[int] = None,
+    *,
+    plain_text: bool = False,
 ) -> dict:
     """调用 Qwen 模型（兼容 OpenAI API）"""
     return _call_openai(
@@ -342,6 +357,7 @@ def _call_qwen(
         total_deadline=total_deadline,
         temperature=temperature,
         request_timeout=request_timeout,
+        plain_text=plain_text,
     )
 
 
@@ -351,6 +367,8 @@ def _call_deepseek(
     total_deadline: Optional[float] = None,
     temperature: Optional[float] = None,
     request_timeout: Optional[int] = None,
+    *,
+    plain_text: bool = False,
 ) -> dict:
     """调用 DeepSeek API，强制使用 UTF-8 编码"""
     import time as _time
@@ -393,15 +411,17 @@ def _call_deepseek(
         try:
             t_http = _per_request_http_timeout(attempt, request_timeout)
             base_url = config.get("base_url", DEEPSEEK_BASE_URL)
-            parsed_lm = attempt_litellm_parsed_json(
-                prompt,
-                "deepseek",
-                config,
-                t_http,
-                temperature,
-                "DeepSeek",
-                _parse_model_response,
-            )
+            parsed_lm = None
+            if not plain_text:
+                parsed_lm = attempt_litellm_parsed_json(
+                    prompt,
+                    "deepseek",
+                    config,
+                    t_http,
+                    temperature,
+                    "DeepSeek",
+                    _parse_model_response,
+                )
             if parsed_lm is not None:
                 return parsed_lm
             resp = get_shared_session().post(
@@ -415,7 +435,7 @@ def _call_deepseek(
             result = response_data["choices"][0]["message"]["content"].strip()
             logging.getLogger(__name__).debug("DeepSeek原始响应长度: %s", len(result))
 
-            parsed = _parse_model_response(result)
+            parsed = _response_text_to_dict(result, plain_text=plain_text)
             logging.getLogger(__name__).debug("DeepSeek解析后结果类型: %s", type(parsed).__name__)
             return parsed
 
@@ -689,6 +709,13 @@ def _validate_and_normalize_structured_output(parsed: dict) -> dict:
         parsed["metadata"] = {}
 
     return parsed
+
+
+def _response_text_to_dict(raw: str, *, plain_text: bool) -> dict:
+    """将模型正文转为统一 dict：抽取链路走 JSON 解析；问答等自然语言走 ``answer`` 单键。"""
+    if plain_text:
+        return {"answer": (raw or "").strip()}
+    return _parse_model_response(raw)
 
 
 def _parse_model_response(result: str) -> dict:

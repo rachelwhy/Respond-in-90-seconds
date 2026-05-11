@@ -784,9 +784,7 @@ def extract_with_batch_api(
             return None
 
     except Exception as e:
-        logger.warning(f"批量请求失败，回退到并行模式: {e}")
-        if not quiet:
-            logger.warning("批量请求失败: %s", e)
+        logger.warning("批量请求失败，回退到并行模式: %s", e)
         return None
 
 
