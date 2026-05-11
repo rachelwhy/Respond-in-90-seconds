@@ -32,7 +32,7 @@ Respond in 90 seconds_A23/
 │   ├── observability/      # Prometheus 等指标（可选）
 │   └── config.py
 ├── third_party/            # 内嵌第三方（如 langextract）
-├── tests/                  # 单元 / 集成（默认不纳入 Git，见 .gitignore）
+├── tests/                  # 单元 / 集成（随仓库版本化；`python -m pytest tests/`）
 ├── scripts/                # 运维脚本（如 verify_qna_deps、download_qna_embedding_model）与本地批测脚本
 ├── profiles/               # 可选：手写 profile JSON 示例（常规模板抽取无需准备此目录）
 ├── storage/                # API 任务与上传持久化
