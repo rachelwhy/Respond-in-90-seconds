@@ -2,7 +2,9 @@ from src.core import model_availability as ma
 
 
 def test_detect_deepseek_missing_key(monkeypatch):
-    monkeypatch.setattr(ma, "DEEPSEEK_API_KEY", "")
+    import src.config as cfg
+
+    monkeypatch.setattr(cfg, "DEEPSEEK_API_KEY", "")
     ma._READY_CACHE.clear()
     out = ma.detect_model_readiness("deepseek", check_ollama=False)
     assert out["ready"] is False
@@ -10,7 +12,9 @@ def test_detect_deepseek_missing_key(monkeypatch):
 
 
 def test_detect_deepseek_with_key(monkeypatch):
-    monkeypatch.setattr(ma, "DEEPSEEK_API_KEY", "sk-ok")
+    import src.config as cfg
+
+    monkeypatch.setattr(cfg, "DEEPSEEK_API_KEY", "sk-ok")
     ma._READY_CACHE.clear()
     out = ma.detect_model_readiness("deepseek", check_ollama=False)
     assert out["ready"] is True

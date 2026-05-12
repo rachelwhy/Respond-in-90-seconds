@@ -1,8 +1,6 @@
-"""
-简化配置模块 - 不使用ConfigManager，直接使用环境变量和默认值
+"""集中读取环境变量与默认值的应用配置（``A23_*`` 优先于无前缀同名变量）。
 
-配置优先级：环境变量 > .env文件 > 默认值
-环境变量格式：A23_<配置名>，例如 A23_MODEL_TYPE
+优先级为进程环境变量覆盖 ``.env`` 再覆盖模块内默认值；密钥与端点均由此注入下游适配器。
 """
 
 import json
@@ -12,17 +10,15 @@ from pathlib import Path
 from typing import Any, List, Optional, Tuple
 
 def _get_env(key: str, default: str = "") -> str:
-    """获取环境变量值，支持A23_前缀"""
-    # 首先尝试带A23_前缀
+    """读取字符串配置：先试 ``A23_<key>``，否则无前缀 ``<key>``，最后 ``default``。"""
     env_key = f"A23_{key}"
     value = os.environ.get(env_key)
     if value is not None:
         return value
-    # 然后尝试不带前缀（向后兼容）
     return os.environ.get(key, default)
 
 def _get_env_int(key: str, default: int = 0) -> int:
-    """获取整数环境变量值"""
+    """读取整数配置；无法解析时返回 ``default``。"""
     value = _get_env(key, str(default))
     try:
         return int(value)
@@ -30,7 +26,7 @@ def _get_env_int(key: str, default: int = 0) -> int:
         return default
 
 def _get_env_float(key: str, default: float = 0.0) -> float:
-    """获取浮点数环境变量值"""
+    """读取浮点配置；无法解析时返回 ``default``。"""
     value = _get_env(key, str(default))
     try:
         return float(value)
@@ -38,12 +34,12 @@ def _get_env_float(key: str, default: float = 0.0) -> float:
         return default
 
 def _get_env_bool(key: str, default: bool = False) -> bool:
-    """获取布尔值环境变量值"""
+    """读取布尔配置（true/1/yes/on/y 视为真）。"""
     value = _get_env(key, str(default)).lower()
     return value in ("true", "1", "yes", "on", "y")
 
 def _get_env_list(key: str, default: list = None) -> list:
-    """获取列表环境变量值（JSON格式）"""
+    """读取 JSON 数组形式的列表配置；非法或空串时返回 ``default``。"""
     if default is None:
         default = []
     value = _get_env(key, "")
@@ -56,7 +52,7 @@ def _get_env_list(key: str, default: list = None) -> list:
 
 # ── 模型配置 ────────────────────────────────────────────────────────────────
 # 默认 deepseek：与仓库联调及本地测试一致，密钥见 .env 中 A23_DEEPSEEK_API_KEY；无密钥时 main 会探测为不可用并走规则抽取。
-MODEL_TYPE = _get_env("MODEL_TYPE", "deepseek")  # deepseek / ollama / openai / qwen
+MODEL_TYPE = _get_env("MODEL_TYPE", "deepseek")  # deepseek / ollama / openai / qwen / moonshot / zhipu / glm / baichuan / siliconflow / doubao
 
 MODELS = _get_env_list("MODELS", [{"type": "deepseek", "model": "deepseek-chat", "priority": 1}])
 
@@ -72,6 +68,31 @@ DEEPSEEK_MODEL = _get_env("DEEPSEEK_MODEL", "deepseek-chat")
 QWEN_BASE_URL = _get_env("QWEN_BASE_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1")
 QWEN_API_KEY = _get_env("QWEN_API_KEY", "")
 QWEN_MODEL = _get_env("QWEN_MODEL", "qwen-plus")
+
+# Moonshot（Kimi）OpenAI 兼容
+MOONSHOT_BASE_URL = _get_env("MOONSHOT_BASE_URL", "https://api.moonshot.cn/v1")
+MOONSHOT_API_KEY = _get_env("MOONSHOT_API_KEY", "")
+MOONSHOT_MODEL = _get_env("MOONSHOT_MODEL", "moonshot-v1-8k")
+
+# 智谱 GLM（OpenAI 兼容路径 /api/paas/v4/chat/completions）
+ZHIPU_BASE_URL = _get_env("ZHIPU_BASE_URL", "https://open.bigmodel.cn/api/paas/v4")
+ZHIPU_API_KEY = _get_env("ZHIPU_API_KEY", "")
+ZHIPU_MODEL = _get_env("ZHIPU_MODEL", "glm-4-flash")
+
+# 百川
+BAICHUAN_BASE_URL = _get_env("BAICHUAN_BASE_URL", "https://api.baichuan-ai.com/v1")
+BAICHUAN_API_KEY = _get_env("BAICHUAN_API_KEY", "")
+BAICHUAN_MODEL = _get_env("BAICHUAN_MODEL", "Baichuan2-Turbo")
+
+# SiliconFlow（硅基流动等聚合）
+SILICONFLOW_BASE_URL = _get_env("SILICONFLOW_BASE_URL", "https://api.siliconflow.cn/v1")
+SILICONFLOW_API_KEY = _get_env("SILICONFLOW_API_KEY", "")
+SILICONFLOW_MODEL = _get_env("SILICONFLOW_MODEL", "Qwen/Qwen2.5-7B-Instruct")
+
+# 火山方舟 / 豆包（OpenAI 兼容，根 URL 一般为 .../api/v3）
+DOUBAO_BASE_URL = _get_env("DOUBAO_BASE_URL", "")
+DOUBAO_API_KEY = _get_env("DOUBAO_API_KEY", "")
+DOUBAO_MODEL = _get_env("DOUBAO_MODEL", "")
 
 OLLAMA_MODEL = _get_env("OLLAMA_MODEL", "qwen2.5:7b")
 OPENAI_MODEL = _get_env("OPENAI_MODEL", "Qwen/Qwen2.5-7B-Instruct")
@@ -117,6 +138,10 @@ MYSQL_DATABASE = _get_env("MYSQL_DATABASE", "a23")
 # ── 字段别名和归一化配置 ──────────────────────────────────────────────────────
 FUZZY_THRESHOLD = _get_env_int("FUZZY_THRESHOLD", 75)
 NORMALIZATION_CONFIG = _get_env("NORMALIZATION_CONFIG", "src/knowledge/field_normalization_rules.json")
+
+# ── 远端 prompt 脱敏（可选；本地 ollama 不启用）────────────────────────────────
+REDACT_REMOTE_PROMPTS = _get_env_bool("REDACT_REMOTE_PROMPTS", False)
+REDACTION_PATTERNS_CONFIG = _get_env("REDACTION_PATTERNS_CONFIG", "src/knowledge/redaction_patterns.json")
 
 # ── 去重配置 ────────────────────────────────────────────────────────────────
 SIMILARITY_THRESHOLD = _get_env_float("SIMILARITY_THRESHOLD", 0.85)
@@ -279,9 +304,9 @@ TEMP_RETENTION_HOURS = _get_env_int("TEMP_RETENTION_HOURS", 1)
 # tasks 目录每个任务保留时长（小时）
 TASK_RETENTION_HOURS = _get_env_int("TASK_RETENTION_HOURS", 24)
 
-# 向后兼容：导出config_manager（简化版本）
+# 向后兼容：旧代码通过 ``config_manager.get`` 读环境变量
 class SimpleConfigManager:
-    """简化配置管理器，用于向后兼容"""
+    """环境变量访问门面，接口与历史 ConfigManager 调用方式对齐。"""
 
     def get(self, key: str, default: Any = None) -> Any:
         return _get_env(key, default)
@@ -302,11 +327,9 @@ class SimpleConfigManager:
 
 config_manager = SimpleConfigManager()
 
-# 辅助函数：获取配置（用于向后兼容）
 def get_config(key: str = None, default: Any = None) -> Any:
-    """获取配置值（简化版本）"""
+    """读取单项配置，或 ``key is None`` 时导出本模块内全部大写常量快照。"""
     if key is None:
-        # 返回所有配置的字典
         import sys
         current_module = sys.modules[__name__]
         config_dict = {}

@@ -1,3 +1,5 @@
+"""纯文本类文件的解析：编码探测、段落切分与与 Docling 对齐的 chunk 尺寸策略。"""
+
 from pathlib import Path
 from typing import Any, Dict, List
 

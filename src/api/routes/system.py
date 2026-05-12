@@ -1,3 +1,5 @@
+"""HTTP：可用模型列举与连通性探测等运维向接口。"""
+
 from __future__ import annotations
 
 import json
@@ -12,7 +14,7 @@ router = APIRouter()
 
 @router.get("/api/models")
 def get_available_models():
-    """获取可用的模型列表和当前配置"""
+    """返回当前 ``MODEL_TYPE`` 与各后端端点配置摘要（含密钥是否已配置）。"""
     from src.config import (
         MODEL_TYPE,
         OLLAMA_URL,
@@ -22,37 +24,50 @@ def get_available_models():
         DEEPSEEK_BASE_URL,
         DEEPSEEK_MODEL,
         DEEPSEEK_API_KEY,
+        QWEN_BASE_URL,
+        QWEN_MODEL,
+        QWEN_API_KEY,
+        MOONSHOT_BASE_URL,
+        MOONSHOT_MODEL,
+        MOONSHOT_API_KEY,
+        ZHIPU_BASE_URL,
+        ZHIPU_MODEL,
+        ZHIPU_API_KEY,
+        BAICHUAN_BASE_URL,
+        BAICHUAN_MODEL,
+        BAICHUAN_API_KEY,
+        SILICONFLOW_BASE_URL,
+        SILICONFLOW_MODEL,
+        SILICONFLOW_API_KEY,
+        DOUBAO_BASE_URL,
+        DOUBAO_MODEL,
+        DOUBAO_API_KEY,
     )
 
+    def _entry(display: str, typ: str, url: str, model: str, api_key: str) -> dict:
+        key = str(api_key or "").strip()
+        if typ in ("ollama", "openai"):
+            avail = True
+        else:
+            avail = bool(key)
+        return {
+            "type": typ,
+            "display_name": display,
+            "url": url,
+            "model": model,
+            "is_available": avail,
+        }
+
     available_models = [
-        {
-            "type": "ollama",
-            "display_name": "Ollama (本地)",
-            "url": OLLAMA_URL,
-            "model": OLLAMA_MODEL,
-            "is_available": True,
-        },
-        {
-            "type": "openai",
-            "display_name": "OpenAI兼容API",
-            "url": OPENAI_BASE_URL,
-            "model": OPENAI_MODEL,
-            "is_available": True,
-        },
-        {
-            "type": "qwen",
-            "display_name": "Qwen (兼容OpenAI)",
-            "url": OPENAI_BASE_URL,
-            "model": OPENAI_MODEL,
-            "is_available": True,
-        },
-        {
-            "type": "deepseek",
-            "display_name": "DeepSeek API",
-            "url": DEEPSEEK_BASE_URL,
-            "model": DEEPSEEK_MODEL,
-            "is_available": bool(DEEPSEEK_API_KEY),
-        },
+        _entry("Ollama (本地)", "ollama", OLLAMA_URL, OLLAMA_MODEL, ""),
+        _entry("OpenAI 兼容", "openai", OPENAI_BASE_URL, OPENAI_MODEL, ""),
+        _entry("通义千问 (DashScope)", "qwen", QWEN_BASE_URL, QWEN_MODEL, QWEN_API_KEY),
+        _entry("DeepSeek", "deepseek", DEEPSEEK_BASE_URL, DEEPSEEK_MODEL, DEEPSEEK_API_KEY),
+        _entry("Moonshot (Kimi)", "moonshot", MOONSHOT_BASE_URL, MOONSHOT_MODEL, MOONSHOT_API_KEY),
+        _entry("智谱 GLM", "zhipu", ZHIPU_BASE_URL, ZHIPU_MODEL, ZHIPU_API_KEY),
+        _entry("百川", "baichuan", BAICHUAN_BASE_URL, BAICHUAN_MODEL, BAICHUAN_API_KEY),
+        _entry("SiliconFlow", "siliconflow", SILICONFLOW_BASE_URL, SILICONFLOW_MODEL, SILICONFLOW_API_KEY),
+        _entry("豆包 (火山方舟)", "doubao", DOUBAO_BASE_URL, DOUBAO_MODEL, DOUBAO_API_KEY),
     ]
 
     return {
@@ -70,6 +85,9 @@ async def test_model_connection(
     model: Optional[str] = Form(default=None),
 ):
     """测试指定模型的连接性"""
+    from src.adapters.openai_compatible_chat import normalize_chat_base_url
+    from src.adapters.provider_env import default_chat_provider_dict, is_chat_openai_compatible
+
     try:
         if model_type == "ollama":
             test_url = url or "http://127.0.0.1:11434/api/generate"
@@ -78,33 +96,25 @@ async def test_model_connection(
             resp.raise_for_status()
             return {"success": True, "message": "Ollama连接成功"}
 
-        if model_type in ["openai", "qwen"]:
-            test_url = (url or "http://localhost:8000/v1") + "/chat/completions"
+        if is_chat_openai_compatible(model_type):
+            cfg = default_chat_provider_dict(model_type)
+            raw_base = str(url or base_url or cfg.get("base_url") or "").strip()
+            base = normalize_chat_base_url(model_type, raw_base)
+            test_url = f"{base.rstrip('/')}/chat/completions"
+            ak = str(api_key if api_key is not None else cfg.get("api_key") or "").strip()
             headers = {"Content-Type": "application/json"}
-            if api_key:
-                headers["Authorization"] = f"Bearer {api_key}"
+            if ak and ak != "not-needed":
+                headers["Authorization"] = f"Bearer {ak}"
             payload = {
-                "model": model or "Qwen/Qwen2.5-7B-Instruct",
+                "model": model or cfg.get("model") or "",
                 "messages": [{"role": "user", "content": "test"}],
                 "max_tokens": 10,
             }
             resp = requests.post(test_url, json=payload, headers=headers, timeout=10)
-            resp.raise_for_status()
-            return {"success": True, "message": "OpenAI兼容API连接成功"}
-
-        if model_type == "deepseek":
-            test_url = (url or "https://api.deepseek.com") + "/chat/completions"
-            headers = {"Content-Type": "application/json", "Authorization": f"Bearer {api_key or 'test'}"}
-            payload = {
-                "model": model or "deepseek-chat",
-                "messages": [{"role": "user", "content": "test"}],
-                "max_tokens": 10,
-            }
-            resp = requests.post(test_url, json=payload, headers=headers, timeout=10)
-            if resp.status_code == 401:
+            if model_type == "deepseek" and resp.status_code == 401:
                 return {"success": False, "message": "API密钥无效或缺失"}
             resp.raise_for_status()
-            return {"success": True, "message": "DeepSeek API连接成功"}
+            return {"success": True, "message": f"{model_type} Chat 兼容端点连接成功"}
 
         return {"success": False, "message": f"不支持的模型类型: {model_type}"}
     except Exception as e:

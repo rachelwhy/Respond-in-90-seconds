@@ -1,3 +1,5 @@
+"""HTTP：服务根路径、健康检查与 Prometheus ``/metrics``。"""
+
 from __future__ import annotations
 
 import time

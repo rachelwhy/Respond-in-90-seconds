@@ -1,3 +1,5 @@
+"""组装 API/CLI 返回体：生成产物路径声明、运行摘要与调试包字段。"""
+
 from __future__ import annotations
 
 from typing import Any, Dict, List, Optional

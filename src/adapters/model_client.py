@@ -1,3 +1,8 @@
+"""统一调用 OpenAI 兼容端点与 Ollama 等后端；抽取结果解析 JSON，问答等可使用 ``plain_text``。
+
+连接参数来自 ``src.config``；可选 LiteLLM 路径见 ``litellm_adapter``。
+"""
+
 import json
 import re
 import os
@@ -20,46 +25,29 @@ from src.config import (
     TEMPERATURE, MAX_TOKENS,
 )
 from src.adapters.shared_http_session import get_shared_session
-from src.adapters.litellm_adapter import attempt_litellm_parsed_json
+from src.adapters.provider_env import is_chat_openai_compatible
 
 # 尝试导入运行时配置（可选）
 try:
-    from src.runtime_config import get_model_config
+    from src.runtime_config import get_model_config as get_runtime_model_config
+
     RUNTIME_CONFIG_AVAILABLE = True
 except ImportError:
     RUNTIME_CONFIG_AVAILABLE = False
-    def get_model_config(model_type=None):
-        # 回退到环境变量配置
-        mt = model_type or MODEL_TYPE
-        if mt == "deepseek":
-            return {
-                "type": mt,
-                "url": OLLAMA_URL,
-                "base_url": DEEPSEEK_BASE_URL,
-                "api_key": DEEPSEEK_API_KEY,
-                "model": DEEPSEEK_MODEL,
-                "temperature": TEMPERATURE,
-                "max_tokens": MAX_TOKENS,
-            }
-        elif mt == "qwen":
-            return {
-                "type": mt,
-                "url": OLLAMA_URL,
-                "base_url": QWEN_BASE_URL,
-                "api_key": QWEN_API_KEY,
-                "model": QWEN_MODEL,
-                "temperature": TEMPERATURE,
-                "max_tokens": MAX_TOKENS,
-            }
-        return {
-            "type": mt,
-            "url": OLLAMA_URL,
-            "base_url": OPENAI_BASE_URL,
-            "api_key": OPENAI_API_KEY,
-            "model": OPENAI_MODEL if mt == "openai" else OLLAMA_MODEL,
-            "temperature": TEMPERATURE,
-            "max_tokens": MAX_TOKENS,
-        }
+    get_runtime_model_config = None
+
+
+def get_model_config(model_type=None):
+    """合并运行时配置（若存在）与 ``provider_env.default_chat_provider_dict``。"""
+    mt = model_type or MODEL_TYPE
+    if RUNTIME_CONFIG_AVAILABLE and get_runtime_model_config is not None:
+        try:
+            return get_runtime_model_config(mt)
+        except Exception:
+            pass
+    from src.adapters.provider_env import default_chat_provider_dict
+
+    return default_chat_provider_dict(mt)
 
 
 def _per_request_http_timeout(attempt: int, request_timeout: Optional[int]) -> int:
@@ -91,6 +79,16 @@ def call_model(
         raise TimeoutError("call_model: 已超过总时间限制")
 
     model_type = model_type or MODEL_TYPE
+    redact_map: Optional[Dict[str, str]] = None
+    try:
+        import src.config as _app_cfg
+        from src.core.prompt_redaction import redact_prompt, restore_model_output, should_apply_remote_redaction
+
+        if should_apply_remote_redaction(model_type, enabled_flag=_app_cfg.REDACT_REMOTE_PROMPTS):
+            prompt, redact_map = redact_prompt(prompt, config_path=_app_cfg.REDACTION_PATTERNS_CONFIG)
+    except Exception as e:
+        logging.getLogger(__name__).warning("prompt 脱敏未应用: %s", e)
+
     logging.getLogger(__name__).info("调用模型: %s, 提示文本长度: %s", model_type, len(prompt))
 
     try:
@@ -103,26 +101,8 @@ def call_model(
                 request_timeout=timeout,
                 plain_text=plain_text,
             )
-        elif model_type == "openai":
-            result = _call_openai(
-                prompt,
-                model_type=model_type,
-                total_deadline=total_deadline,
-                temperature=temperature,
-                request_timeout=timeout,
-                plain_text=plain_text,
-            )
-        elif model_type == "qwen":
-            result = _call_qwen(
-                prompt,
-                model_type=model_type,
-                total_deadline=total_deadline,
-                temperature=temperature,
-                request_timeout=timeout,
-                plain_text=plain_text,
-            )
-        elif model_type == "deepseek":
-            result = _call_deepseek(
+        elif is_chat_openai_compatible(model_type):
+            result = _call_remote_chat(
                 prompt,
                 model_type=model_type,
                 total_deadline=total_deadline,
@@ -144,6 +124,8 @@ def call_model(
         else:
             logging.getLogger(__name__).warning("模型返回空结果")
 
+        if redact_map:
+            result = restore_model_output(result, redact_map)
         return result
     except Exception as e:
         logging.getLogger(__name__).error("模型调用失败: %s", e)
@@ -247,6 +229,45 @@ def _call_ollama(
     raise Exception(f"Ollama调用失败，重试{max_retries}次后仍然超时: {last_exception}")
 
 
+def _call_remote_chat(
+    prompt: str,
+    *,
+    model_type: str,
+    total_deadline: Optional[float] = None,
+    temperature: Optional[float] = None,
+    request_timeout: Optional[int] = None,
+    plain_text: bool = False,
+) -> dict:
+    """所有 OpenAI Chat Completions 兼容远端（含国内主流云 API）的统一入口。"""
+    from src.adapters.openai_compatible_chat import call_openai_compatible_chat
+
+    mt = (model_type or "").strip().lower()
+    route_labels = {
+        "deepseek": "DeepSeek",
+        "qwen": "Qwen",
+        "openai": "OpenAI 兼容",
+        "moonshot": "Moonshot",
+        "zhipu": "智谱",
+        "glm": "智谱",
+        "baichuan": "百川",
+        "siliconflow": "SiliconFlow",
+        "doubao": "豆包",
+    }
+    label = route_labels.get(mt, mt)
+    cfg = get_model_config(mt)
+    return call_openai_compatible_chat(
+        prompt,
+        model_type=mt,
+        config=cfg,
+        total_deadline=total_deadline,
+        request_timeout=request_timeout,
+        temperature=temperature,
+        plain_text=plain_text,
+        route_label=label,
+        response_text_to_dict=_response_text_to_dict,
+    )
+
+
 def _call_openai(
     prompt: str,
     model_type: Optional[str] = None,
@@ -256,89 +277,14 @@ def _call_openai(
     *,
     plain_text: bool = False,
 ) -> dict:
-    """调用 OpenAI 兼容 API（如本地部署的 Qwen），强制使用 UTF-8 编码"""
-    import time as _time
-    import json
-    # 获取运行时配置
-    config = get_model_config(model_type or "openai")
-
-    headers = {
-        "Content-Type": "application/json; charset=utf-8",
-    }
-
-    api_key = config.get("api_key", OPENAI_API_KEY)
-    if api_key and api_key != "not-needed":
-        headers["Authorization"] = f"Bearer {api_key}"
-
-    # 确保 prompt 是有效的 UTF-8 字符串
-    if isinstance(prompt, bytes):
-        prompt = prompt.decode('utf-8', errors='replace')
-    else:
-        prompt = prompt.encode('utf-8', errors='replace').decode('utf-8')
-
-    payload = {
-        "model": config.get("model", OPENAI_MODEL),
-        "messages": [{"role": "user", "content": prompt}],
-        "temperature": temperature if temperature is not None else config.get("temperature", TEMPERATURE),
-        "max_tokens": config.get("max_tokens", MAX_TOKENS),
-        "stream": False
-    }
-
-    # 手动序列化 JSON，确保使用 UTF-8（不依赖系统默认编码）
-    json_str = json.dumps(payload, ensure_ascii=False)
-    json_bytes = json_str.encode('utf-8')
-
-    max_retries = 3
-    last_exception = None
-
-    for attempt in range(max_retries):
-        if total_deadline and _time.time() > total_deadline:
-            raise TimeoutError("OpenAI: 已超过总时间限制")
-        try:
-            t_http = _per_request_http_timeout(attempt, request_timeout)
-            base_url = config.get("base_url", OPENAI_BASE_URL)
-            parsed_lm = None
-            if not plain_text:
-                parsed_lm = attempt_litellm_parsed_json(
-                    prompt,
-                    model_type or "openai",
-                    config,
-                    t_http,
-                    temperature,
-                    "OpenAI 兼容",
-                    _parse_model_response,
-                )
-            if parsed_lm is not None:
-                return parsed_lm
-            # 使用 data 参数发送字节流，而非 json 参数
-            resp = get_shared_session().post(
-                f"{base_url}/chat/completions", data=json_bytes, headers=headers, timeout=t_http
-            )
-            resp.raise_for_status()
-            response_data = resp.json()
-            result = response_data["choices"][0]["message"]["content"].strip()
-            logging.getLogger(__name__).debug("OpenAI原始响应长度: %s", len(result))
-
-            parsed = _response_text_to_dict(result, plain_text=plain_text)
-            logging.getLogger(__name__).debug("OpenAI解析后结果类型: %s", type(parsed).__name__)
-            return parsed
-
-        except requests.exceptions.Timeout as e:
-            logging.getLogger(__name__).warning(
-                "OpenAI API调用超时，尝试 %s/%s，超时设置: %s秒",
-                attempt + 1,
-                max_retries,
-                t_http,
-            )
-            last_exception = e
-            if attempt < max_retries - 1:
-                _time.sleep(2)  # 等待2秒后重试
-        except Exception as e:
-            # 其他错误，不重试
-            raise e
-
-    # 所有重试都失败
-    raise Exception(f"OpenAI API调用失败，重试{max_retries}次后仍然超时: {last_exception}")
+    return _call_remote_chat(
+        prompt,
+        model_type=model_type or "openai",
+        total_deadline=total_deadline,
+        temperature=temperature,
+        request_timeout=request_timeout,
+        plain_text=plain_text,
+    )
 
 
 def _call_qwen(
@@ -350,10 +296,9 @@ def _call_qwen(
     *,
     plain_text: bool = False,
 ) -> dict:
-    """调用 Qwen 模型（兼容 OpenAI API）"""
-    return _call_openai(
+    return _call_remote_chat(
         prompt,
-        model_type or "qwen",
+        model_type=model_type or "qwen",
         total_deadline=total_deadline,
         temperature=temperature,
         request_timeout=request_timeout,
@@ -370,90 +315,14 @@ def _call_deepseek(
     *,
     plain_text: bool = False,
 ) -> dict:
-    """调用 DeepSeek API，强制使用 UTF-8 编码"""
-    import time as _time
-    import json
-
-    config = get_model_config(model_type or "deepseek")
-
-    headers = {
-        "Content-Type": "application/json; charset=utf-8",
-    }
-
-    api_key = config.get("api_key", DEEPSEEK_API_KEY)
-    if api_key:
-        headers["Authorization"] = f"Bearer {api_key}"
-
-    # 确保 prompt 是有效的 UTF-8 字符串
-    if isinstance(prompt, bytes):
-        prompt = prompt.decode('utf-8', errors='replace')
-    else:
-        prompt = prompt.encode('utf-8', errors='replace').decode('utf-8')
-
-    payload = {
-        "model": config.get("model", DEEPSEEK_MODEL),
-        "messages": [{"role": "user", "content": prompt}],
-        "temperature": temperature if temperature is not None else config.get("temperature", TEMPERATURE),
-        "max_tokens": config.get("max_tokens", MAX_TOKENS),
-        "stream": False
-    }
-
-    # 手动序列化 JSON，确保使用 UTF-8（不依赖系统默认编码）
-    json_str = json.dumps(payload, ensure_ascii=False)
-    json_bytes = json_str.encode('utf-8')
-
-    max_retries = 3
-    last_exception = None
-
-    for attempt in range(max_retries):
-        if total_deadline and _time.time() > total_deadline:
-            raise TimeoutError("DeepSeek: 已超过总时间限制")
-        try:
-            t_http = _per_request_http_timeout(attempt, request_timeout)
-            base_url = config.get("base_url", DEEPSEEK_BASE_URL)
-            parsed_lm = None
-            if not plain_text:
-                parsed_lm = attempt_litellm_parsed_json(
-                    prompt,
-                    "deepseek",
-                    config,
-                    t_http,
-                    temperature,
-                    "DeepSeek",
-                    _parse_model_response,
-                )
-            if parsed_lm is not None:
-                return parsed_lm
-            resp = get_shared_session().post(
-                f"{base_url}/chat/completions",
-                data=json_bytes,
-                headers=headers,
-                timeout=t_http,
-            )
-            resp.raise_for_status()
-            response_data = resp.json()
-            result = response_data["choices"][0]["message"]["content"].strip()
-            logging.getLogger(__name__).debug("DeepSeek原始响应长度: %s", len(result))
-
-            parsed = _response_text_to_dict(result, plain_text=plain_text)
-            logging.getLogger(__name__).debug("DeepSeek解析后结果类型: %s", type(parsed).__name__)
-            return parsed
-
-        except requests.exceptions.Timeout as e:
-            logging.getLogger(__name__).warning(
-                "DeepSeek API调用超时，尝试 %s/%s",
-                attempt + 1,
-                max_retries,
-            )
-            last_exception = e
-            if attempt < max_retries - 1:
-                _time.sleep(2)
-        except Exception as e:
-            raise e
-
-    raise Exception(f"DeepSeek API调用失败，重试{max_retries}次后仍然超时: {last_exception}")
-
-
+    return _call_remote_chat(
+        prompt,
+        model_type=model_type or "deepseek",
+        total_deadline=total_deadline,
+        temperature=temperature,
+        request_timeout=request_timeout,
+        plain_text=plain_text,
+    )
 
 
 def _fix_json_common_issues(json_str: str) -> str:
@@ -1097,7 +966,7 @@ class ModelGateway:
                     resp.raise_for_status()
                     status = "healthy"
                 else:
-                    # 其他模型类型暂时标记为未知
+                    # 未单独实现探测的模型类型标记为 unknown
                     status = "unknown"
 
                 elapsed = time.time() - start_time

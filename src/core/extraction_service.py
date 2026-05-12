@@ -1,17 +1,6 @@
-"""
-核心抽取服务 - 从main.py提取的核心业务逻辑
+"""文档结构化抽取实现：提示构建、分块调度、模型调用与记录合并，供 CLI 与 HTTP 共用。
 
-职责：
-1. 提供统一的文档抽取接口
-2. 包含智能提示构建、分块抽取、记录合并等核心逻辑
-3. 支持配置化参数，与CLI解耦
-4. 为API服务和CLI提供统一的抽取能力
-
-设计原则：
-1. 单一职责：专注于抽取逻辑，不处理CLI参数或文件I/O
-2. 可配置：所有参数可通过构造函数或方法参数配置
-3. 可测试：易于单元测试和集成测试
-4. 向后兼容：保持与现有main.py相同的接口和行为
+不解析命令行或 HTTP 表单；文件与路径 I/O 由调用方注入。参数通过构造函数与 ``src.config`` 对齐，对外行为与历史 CLI 路径保持一致。
 """
 
 import json
@@ -25,7 +14,6 @@ from pathlib import Path
 from src.core.interfaces import IExtractionService
 from src.core.llm_runtime import resolve_llm_mode_with_readiness
 
-# 导入必要的模块
 try:
     from src.config import get_config
     _config = None  # 不再使用ConfigManager，改为直接使用get_config()
@@ -43,10 +31,10 @@ _DEFAULT_EXTRACT_TIME_BUDGET_S = 240
 
 
 class CoreExtractionService(IExtractionService):
-    """核心抽取服务，封装从main.py提取的核心业务逻辑"""
+    """面向 CLI/API 的统一抽取服务实例。"""
 
     def __init__(self, config: Optional[Dict[str, Any]] = None):
-        """初始化抽取服务
+        """构造服务实例；``config`` 为可选运行时覆盖字典。
 
         Args:
             config: 配置字典，用于覆盖默认配置
@@ -54,12 +42,9 @@ class CoreExtractionService(IExtractionService):
         self.config = config or {}
         self._initialize_components()
 
-    def _initialize_components(self):
-        """初始化内部组件"""
-        # 这里可以初始化FieldNormalizer、ModelRegistry等
+    def _initialize_components(self) -> None:
+        """预留的组件挂载点；当前无状态依赖此处初始化。"""
         pass
-
-    # ===== 从main.py提取的核心函数 =====
 
     @staticmethod
     def _build_runtime_constraints(text: str, field_names: List[str], task_mode: str) -> str:
@@ -92,7 +77,7 @@ class CoreExtractionService(IExtractionService):
         return "\n".join(lines)
 
     def build_smart_prompt(self, text: str, profile: dict) -> str:
-        """根据profile和文本构建抽取prompt（从main.py复制）"""
+        """按 profile 中的字段、任务类型与模板模式组装发往模型的抽取提示。"""
         instruction = profile.get("instruction", "请根据字段要求，从文档中提取信息。")
         fields = profile.get("fields", [])
         task_mode = profile.get("task_mode", "single_record")
@@ -420,8 +405,7 @@ class CoreExtractionService(IExtractionService):
         return extracted, extracted, meta
 
     def extract_with_slicing(self, text: str, profile: dict, use_model: bool = True, slice_size: Optional[int] = None, overlap: int = 100, show_progress: bool = True, time_budget: int = _DEFAULT_EXTRACT_TIME_BUDGET_S, chunks: list = None, max_chunks: int = 50, logger=None, word_table_segments: Optional[List[str]] = None, routing_bundle: Optional[Dict[str, Any]] = None):
-        """使用切片模式进行抽取。优先使用 Docling 语义分块（chunks），回退到字符切片。
-        从main.py复制的函数实现
+        """在切片上下文内抽取：存在 Docling ``chunks`` 时按其分段；否则按字符窗口切片。
 
         Args:
             text: 完整文档文本
@@ -612,9 +596,9 @@ class CoreExtractionService(IExtractionService):
                 })
 
             if not text_chunks:
-                # 所有 chunk 均为表格时，回退到全文 prompt 抽取，避免直接返回空结果。
+                # 语义块均为表格型且无可用正文块时，改用整篇文本单次 prompt，避免空结果。
                 if text and text.strip() and use_model:
-                    _log('[INFO] 语义块均为表格，回退到全文 prompt 抽取')
+                    _log('[INFO] 语义块均为表格，改用全文 prompt 抽取')
                     prompt = self.build_smart_prompt(text, profile)
                     from src.adapters.model_client import call_model
                     elapsed = time.perf_counter() - start_time
@@ -674,13 +658,13 @@ class CoreExtractionService(IExtractionService):
                         }
                     })
                 elif lx_records is not None:
-                    _log('[INFO] langextract 返回空结果，回退到 prompt 方案')
+                    _log('[INFO] langextract 返回空结果，改用 prompt 路径')
             except TimeoutError:
-                _log('[WARN] langextract 因时间不足跳过，回退到 prompt 方案')
+                _log('[WARN] langextract 因时间不足跳过，改用 prompt 路径')
             except Exception as e:
-                _log(f'[WARN] langextract 不可用: {e}，使用 prompt 方案')
+                _log(f'[WARN] langextract 不可用: {e}，使用 prompt 路径')
 
-            # ── 回退：手动分块 + prompt + call_model ──
+            # langextract 未产出或未启用：拼接或逐块 prompt + call_model
 
             # 基于总字符数决定是否合并：阈值来自配置，降低单次 prompt 体积以减轻超时
             total_chars = sum(len(c.get("text", "")) for c in text_chunks)
@@ -802,9 +786,9 @@ class CoreExtractionService(IExtractionService):
                 "mode": "semantic_chunks", "chunk_count": total_chunks,
             })
 
-        # ── 回退：字符切片模式 ─────────────────────────────────────────────────
+        # 无语义块或未走语义路径：按字符窗口切片
 
-        # 计算字符切片模式可用的时间预算
+        # 字符切片可用时间预算
         elapsed_before_char_slicing = time.perf_counter() - start_time
         remaining_total_time = max(1, TIME_BUDGET_SECONDS - elapsed_before_char_slicing)
 
@@ -950,18 +934,9 @@ class CoreExtractionService(IExtractionService):
         return extracted_raw, merged_model_output, _with_routing(slicing_metadata)
 
     def merge_records_by_key(self, records: List[Dict], key_fields: Optional[List[str]] = None) -> List[Dict]:
-        """基于关键字段的记录融合去重（智能增强版）。
+        """按关键字段融合记录并在近似重复时二次合并（rapidfuzz 可选）。
 
-        增强功能：
-        1. 自动检测关键字段（当未指定时）
-        2. 基于关键字段的合并优先
-        3. 基于内容相似度的二次合并（当 rapidfuzz 可用时）
-        4. 保留原文顺序，清理内部标记字段
-
-        相同键的记录进行字段级合并：新记录的非空值覆盖旧记录的空值。
-        所有关键字段均为空的记录保留并打上 _unkeyed=True 标记。
-
-        从main.py复制的函数实现
+        键一致或相似度达阈值时合并字段值（非空覆盖空），保留输入顺序；全无键字段时保留行并标记 ``_unkeyed``。
         """
         from src.core.chunk_merger import smart_merge_records
         # 使用去重配置获取阈值
@@ -969,15 +944,9 @@ class CoreExtractionService(IExtractionService):
             from src.core.deduplication_config import get_similarity_threshold
             threshold = get_similarity_threshold("record_merger")
         except ImportError:
-            # 如果去重配置模块不可用，使用默认值0.98（保持向后兼容）
             threshold = 0.98
 
-        # 使用智能合并函数（向后兼容）
-        # 相似度阈值从配置获取，仅合并几乎完全相同的记录
-        # 避免仅凭字段结构相似而合并不同实体行：合并前须满足键字段一致或相似度阈值
         return smart_merge_records(records, key_fields, similarity_threshold=threshold)
-
-    # ===== 统一抽取接口 =====
 
     def extract_from_text(self, text: str, profile: dict,
                           llm_mode: str = "full",
@@ -1073,27 +1042,20 @@ class CoreExtractionService(IExtractionService):
 
         return self.extract_from_text(text, profile, **kwargs)
 
-    # ===== 工具方法 =====
-
     def _get_config(self, key: str, default: Any = None) -> Any:
-        """获取配置值 - 简化版本，不使用ConfigManager"""
-        # 首先检查实例配置
+        """读取配置：实例 ``config`` 字典优先，其次 ``src.config`` 模块属性或 ``get_config``，最后 ``A23_<KEY>`` 环境变量。"""
         if key in self.config:
             return self.config[key]
 
-        # 尝试从src.config获取
         try:
             import src.config as config_module
-            # 检查config模块是否有该属性
             if hasattr(config_module, key):
                 return getattr(config_module, key)
-            # 或者使用get_config函数如果存在
             if hasattr(config_module, 'get_config'):
                 return config_module.get_config(key, default)
         except ImportError:
             pass
 
-        # 最后尝试环境变量
         import os
         env_key = f"A23_{key.upper()}"
         if env_key in os.environ:
@@ -1111,11 +1073,10 @@ class CoreExtractionService(IExtractionService):
             return {}
 
 
-# 全局默认实例（用于向后兼容）
 _default_service = None
 
 def get_extraction_service(config: Optional[Dict[str, Any]] = None) -> CoreExtractionService:
-    """获取抽取服务实例（单例模式，用于向后兼容）"""
+    """返回进程内默认 ``CoreExtractionService``；传入 ``config`` 时重建实例。"""
     global _default_service
     if _default_service is None or config is not None:
         _default_service = CoreExtractionService(config)

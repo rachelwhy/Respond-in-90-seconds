@@ -176,7 +176,7 @@ def row_matches_constraint(
     candidate_columns: Optional[Iterable[str]] = None,
 ) -> bool:
     """
-    行级执行器：优先在列候选上做类型化比较，失败再回退到行文本匹配。
+    行级执行器：列候选上优先类型化比较，未决时用整行文本匹配。
     """
     cols = [c for c in (candidate_columns or []) if c in row]
     if constraint.op == "contains_any":

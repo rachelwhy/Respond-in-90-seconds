@@ -1,3 +1,5 @@
+"""按后缀在 Docling 版式解析与纯文本解析之间 dispatch，并返回选用的解析器与调度原因。"""
+
 from __future__ import annotations
 
 from pathlib import Path

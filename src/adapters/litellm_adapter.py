@@ -1,12 +1,6 @@
-"""
-可选 LiteLLM 适配层（集中在此文件，便于维护）：
+"""可选 LiteLLM 聚合调用：模型 id 解析、completion 与 JSON 解析回调注入（与 ``model_client`` 单向依赖）。
 
-- 模型 id 解析、completion 调用
-- 启用开关、异常与回退日志
-- 与业务 JSON 解析通过 parse_fn 注入，避免与 model_client 循环引用
-
-启用：A23_USE_LITELLM=true 且已 pip install litellm。
-模型 id：可用 A23_LITELLM_MODEL 覆盖；否则按 model_type 自动拼接。
+启用条件：``A23_USE_LITELLM=true`` 且已安装 ``litellm``；模型串可用 ``A23_LITELLM_MODEL`` 覆盖。
 """
 
 from __future__ import annotations
@@ -20,14 +14,29 @@ logger = logging.getLogger(__name__)
 
 
 def resolve_litellm_model_id(model_type: str, model_name: str, override: Optional[str] = None) -> str:
-    """解析 LiteLLM 的 model 字符串（便于单测与排查）。"""
+    """解析 LiteLLM 的 ``model`` 字符串（与 ``provider_env`` 中 ``MODEL_TYPE`` 取值对齐）。"""
     o = (override if override is not None else LITELLM_MODEL or "").strip()
     if o:
         return o
     mn = (model_name or "").strip()
-    if model_type == "deepseek":
-        return f"deepseek/{mn}" if mn and "/" not in mn else mn
-    return f"openai/{mn}" if mn and "/" not in mn else mn
+    if mn and "/" in mn:
+        return mn
+    mt = (model_type or "").strip().lower()
+    if mt == "deepseek":
+        return f"deepseek/{mn}" if mn else mn
+    if mt == "qwen":
+        return f"dashscope/{mn}" if mn else mn
+    if mt == "moonshot":
+        return f"moonshot/{mn}" if mn else mn
+    if mt in ("zhipu", "glm"):
+        return f"zhipu/{mn}" if mn else mn
+    if mt == "baichuan":
+        return f"openai/{mn}" if mn else mn
+    if mt == "siliconflow":
+        return f"openai/{mn}" if mn else mn
+    if mt == "doubao":
+        return f"openai/{mn}" if mn else mn
+    return f"openai/{mn}" if mn else mn
 
 
 def litellm_chat_user_text(
@@ -97,5 +106,5 @@ def attempt_litellm_parsed_json(
         logger.warning("USE_LITELLM 已开启但未安装 litellm，使用 HTTP")
         return None
     except Exception as e:
-        logger.warning("LiteLLM(%s) 失败，回退 HTTP: %s", route_label, e)
+        logger.warning("LiteLLM(%s) 失败，改用直连 HTTP: %s", route_label, e)
         return None

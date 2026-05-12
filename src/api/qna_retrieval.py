@@ -1,7 +1,6 @@
-"""
-问答检索：BM25（rank-bm25）+ 向量相似度混合，向量优先 sentence-transformers，缺省回退 Ollama embedding。
+"""混合检索：BM25 与向量相似度融合；向量编码优先本地 sentence-transformers，不可用时使用配置的 embedding 端点。
 
-与 ``qna_service`` 解耦，避免循环引用；缓存文件仍写入会话目录 ``embedding_cache.json``（与旧逻辑兼容）。
+模块独立编排以避免与 ``qna_service`` 循环依赖；会话目录可含 ``embedding_cache.json``。
 """
 
 from __future__ import annotations

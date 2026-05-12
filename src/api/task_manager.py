@@ -1,11 +1,6 @@
-"""
-任务管理器 — 异步任务队列，供 api_server.py 使用
+"""异步长任务：创建工作目录、子进程执行 ``main.py`` 同级流程，并提供状态与日志查询。
 
-职责边界：
-- 创建/管理任务工作目录
-- 异步执行主流程（main.py 逻辑）
-- 提供状态查询和日志读取接口
-- 不涉及数据库存储（由后端负责）
+由 ``A23_ENABLE_TASKS`` 门控加载；任务元数据与产出位于 ``storage/tasks``，不包含应用业务库写入。
 """
 
 from __future__ import annotations
@@ -169,7 +164,7 @@ class TaskManager:
         info = self._tasks.get(task_id)
         if not info:
             return []
-        # 优先读取新版日志文件名，回退到旧版
+        # 优先读新版日志文件名，不存在则读旧版文件名
         for log_name in ("extraction.log", "task.log"):
             log_path = info.task_dir / log_name
             if log_path.exists():

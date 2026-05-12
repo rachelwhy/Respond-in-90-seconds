@@ -1,3 +1,5 @@
+"""HTTP：异步任务创建、状态与产出下载 ``/api/tasks/*``（受 ``A23_ENABLE_TASKS`` 门控）。"""
+
 from __future__ import annotations
 
 import asyncio

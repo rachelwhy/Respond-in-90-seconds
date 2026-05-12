@@ -1,16 +1,6 @@
-"""
-langextract 适配器 — 将 Google langextract 集成到 A23 提取流水线
+"""将 langextract 接入切片抽取流水线：批量结构化抽取、并行度与后端探测。
 
-支持模型后端：
-- Ollama 本地模型（qwen2.5:7b/14b 等）
-- DeepSeek API（deepseek-chat）
-- OpenAI API（gpt-4o 等）
-- Qwen API（通义千问，OpenAI 兼容接口）
-
-策略：
-- 云 API (DeepSeek/OpenAI/Qwen) → 使用 langextract（结构化输出更精确）
-- 本地 Ollama 7B → 跳过 langextract，回退到 prompt 方案（更高效）
-- 本地 Ollama 14B+ → 使用 langextract（模型够强，prompt 开销可接受）
+云 API 与较强本地模型启用 langextract；轻量本地模型改用直接提示以降低延迟与资源占用。
 """
 
 from __future__ import annotations
@@ -26,9 +16,7 @@ from typing import Any, Dict, List, Optional
 from src.core.debug_flags import is_debug_enabled
 from src.config import config_manager
 
-# 模型检测 - 简化版本（不依赖ModelRegistry）
-# 从环境变量或config.py获取模型信息
-_model_registry = None  # 不再使用ModelRegistry
+_model_registry = None
 
 logger = logging.getLogger(__name__)
 
@@ -84,20 +72,17 @@ def _check_langextract():
 
 
 def _get_model_size_hint(model_name: str) -> int:
-    """从模型名称推测参数量（单位：B），用于判断是否适合 langextract
+    """从模型名称推测参数量（单位：B），用于判断是否适合 langextract。
 
-    优先使用ModelRegistry获取准确大小，失败时回退到硬编码逻辑
+    若存在 ModelRegistry 则取其登记值；否则用语义正则与已知前缀表推断。
     """
-    # 优先使用ModelRegistry
     if _model_registry is not None:
         try:
             size = _model_registry.get_model_size(model_name)
             return size
         except Exception as e:
             logger.debug(f"ModelRegistry获取模型大小失败 {model_name}: {e}")
-            # 回退到硬编码逻辑
 
-    # 回退到原有的硬编码逻辑
     m = re.search(r'(\d+)[bB]', model_name)
     if m:
         return int(m.group(1))
@@ -118,47 +103,26 @@ def _create_langextract_model(model_type: str):
     Returns:
         (model_instance, model_id, is_cloud, model_size_b)
     """
+    from src.adapters.openai_compatible_chat import normalize_chat_base_url
+    from src.adapters.provider_env import default_chat_provider_dict, is_langextract_openai_compatible
+
     model_type = model_type.lower()
     _dprint(f"_create_langextract_model: model_type='{model_type}'")
 
-    # 通用 OpenAI 兼容模型（DeepSeek、OpenAI、Qwen）
-    if model_type in ("deepseek", "openai", "qwen"):
+    if is_langextract_openai_compatible(model_type):
         from langextract.providers.openai import OpenAILanguageModel
 
-        # 关键：禁用 provider 内部并行，避免和外层并行叠加（固定为 1，不暴露配置）
         provider_workers = 1
-
-        if model_type == "deepseek":
-            api_key = _get_config("DEEPSEEK_API_KEY", "").strip()
-            base_url = _get_config("DEEPSEEK_BASE_URL", "https://api.deepseek.com").strip()
-            model_name = _get_config("DEEPSEEK_MODEL", "deepseek-chat").strip()
-            # 使用ModelRegistry获取模型大小，失败时回退到默认值
-            model_size = _get_model_size_hint(model_name) if _model_registry is None else _model_registry.get_model_size(model_name)
-
-        elif model_type == "openai":
-            api_key = _get_config("OPENAI_API_KEY", "").strip()
-            base_url = _get_config("OPENAI_BASE_URL", "https://api.openai.com/v1").strip()
-            model_name = _get_config("OPENAI_MODEL", "gpt-4o").strip()
-            # 使用ModelRegistry获取模型大小，失败时回退到默认值
-            model_size = _get_model_size_hint(model_name) if _model_registry is None else _model_registry.get_model_size(model_name)
-
-        else:  # qwen
-            # Qwen配置，支持回退到OpenAI配置
-            api_key = _get_config("QWEN_API_KEY", _get_config("OPENAI_API_KEY", "")).strip()
-            base_url = _get_config("QWEN_BASE_URL", _get_config("OPENAI_BASE_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1")).strip()
-            model_name = _get_config("QWEN_MODEL", _get_config("OPENAI_MODEL", "qwen-plus")).strip()
-            # 使用ModelRegistry获取模型大小，失败时回退到默认值
-            model_size = _get_model_size_hint(model_name) if _model_registry is None else _model_registry.get_model_size(model_name)
-
-        # base_url 规范化：只做最小必要修正
-        if model_type == "openai":
-            if not base_url.rstrip("/").endswith("/v1"):
-                base_url = base_url.rstrip("/") + "/v1"
-        elif model_type == "qwen":
-            # Qwen 兼容接口需要 /compatible-mode/v1
-            if "/compatible-mode/v1" not in base_url:
-                base_url = base_url.rstrip("/") + "/compatible-mode/v1"
-        # deepseek 保持原样，不在这里强行补 /v1
+        cfg = default_chat_provider_dict(model_type)
+        api_key = str(cfg.get("api_key") or "").strip()
+        raw_base = str(cfg.get("base_url") or "").strip()
+        base_url = normalize_chat_base_url(model_type, raw_base)
+        model_name = str(cfg.get("model") or "").strip()
+        model_size = (
+            _get_model_size_hint(model_name)
+            if _model_registry is None
+            else _model_registry.get_model_size(model_name)
+        )
 
         _dprint(
             "create OpenAI-compatible model: "
@@ -171,11 +135,10 @@ def _create_langextract_model(model_type: str):
             model_id=model_name,
             api_key=api_key,
             base_url=base_url,
-            max_workers=provider_workers,  # 关键：默认 1
+            max_workers=provider_workers,
         )
         return model, model_name, True, model_size
 
-    # Ollama 本地模型
     if model_type == "ollama":
         from langextract.providers.ollama import OllamaLanguageModel
         model_name = _get_config("OLLAMA_MODEL", "qwen2.5:7b").strip()
@@ -185,13 +148,7 @@ def _create_langextract_model(model_type: str):
         model = OllamaLanguageModel(model_id=model_name, model_url=model_url)
         return model, model_name, False, size
 
-    # 未知类型，默认 Ollama
-    _dprint("unknown model_type; fallback to Ollama")
-    from langextract.providers.ollama import OllamaLanguageModel
-    model_name = _get_config("OLLAMA_MODEL", "qwen2.5:7b").strip()
-    model_url = _get_config("OLLAMA_URL", "http://127.0.0.1:11434").strip()
-    model = OllamaLanguageModel(model_id=model_name, model_url=model_url)
-    return model, model_name, False, _get_model_size_hint(model_name)
+    raise ValueError(f"langextract 不支持的 MODEL_TYPE: {model_type}")
 
 
 def _build_example_from_profile(profile: dict) -> Any:
@@ -490,17 +447,15 @@ def extract_with_langextract(
     time_budget: Optional[float] = None,
     quiet: bool = False,
 ) -> Optional[List[Dict]]:
-    _dprint(f"extract_with_langextract called: chunks={len(text_chunks)}, quiet={quiet}")
-    """使用自适应策略从文本块列表中提取结构化记录
+    """使用自适应策略从文本块列表中提取结构化记录。
 
-    当前稳定性策略：
-    - 删除运行期环境变量改写，避免并行时竞争
-    - 云 API 使用外层并行，provider 内层 max_workers 固定为 1
-    - 暂时禁用 batch 路径，先确保主链路稳定
+    稳定性约定：不改写进程级环境变量；云 API 场景外层并行、provider 内 ``max_workers=1``；
+    batch API 策略未启用时与 ``parallel`` 一致。
 
     Returns:
-        成功时返回 List[Dict]，失败时返回 None（调用方应回退）
+        成功时为记录列表；失败、跳过或小模型短路时为 ``None``（上层改用 prompt 路径）。
     """
+    _dprint(f"extract_with_langextract called: chunks={len(text_chunks)}, quiet={quiet}")
     if not _check_langextract():
         return None
 
@@ -511,7 +466,7 @@ def extract_with_langextract(
         model_instance, model_id, is_cloud, model_size = _create_langextract_model(model_type)
         _dprint(f"extract_with_langextract: model_id={model_id}, is_cloud={is_cloud}, model_size={model_size}B")
 
-        # 2. 本地小模型直接回退 prompt 方案（更稳定更快）
+        # 2. 本地小模型跳过 langextract，由上层使用 prompt 路径
         if not is_cloud and model_size < 14:
             if not quiet:
                 logger.info("本地 %sB 模型，使用 prompt 方案（更高效）", model_size)
@@ -539,7 +494,7 @@ def extract_with_langextract(
                 text_chunks, profile, max_workers, quiet, time_budget=time_budget
             )
         else:
-            # 当前版本不走 batch，统一回退到 parallel
+            # batch 策略未启用，与 parallel 共用实现
             records = extract_with_langextract_parallel(
                 text_chunks, profile, max_workers, quiet, time_budget=time_budget
             )
@@ -560,7 +515,7 @@ def extract_with_langextract(
         return records
 
     except Exception as e:
-        logger.warning(f"自适应提取失败，将回退到 prompt 方案: {e}")
+        logger.warning("自适应提取失败，上层将改用 prompt 路径: %s", e)
         return None
 
 
@@ -685,9 +640,9 @@ def extract_with_langextract_parallel(
         if merged_results:
             return merged_results
 
-        # 并行无结果时，回退到串行直提一次
+        # 并行无结果时串行再试一次
         if not quiet:
-            logger.warning("并行结果为空，回退到串行直提")
+            logger.warning("并行结果为空，改用串行 langextract")
         model_instance, model_id, is_cloud, _ = _create_langextract_model(model_type)
         return _extract_with_langextract_direct(
             text_chunks, profile, model_instance, model_id, is_cloud, quiet=quiet
@@ -695,7 +650,7 @@ def extract_with_langextract_parallel(
 
     except Exception as e:
         if not quiet:
-            logger.warning("并行提取失败，回退到串行直提: %s", e)
+            logger.warning("并行提取失败，改用串行 langextract: %s", e)
         model_instance, model_id, is_cloud, _ = _create_langextract_model(model_type)
         return _extract_with_langextract_direct(
             text_chunks, profile, model_instance, model_id, is_cloud, quiet=quiet
@@ -707,10 +662,9 @@ def extract_with_batch_api(
     profile: dict,
     quiet: bool = False,
 ) -> Optional[List[Dict]]:
-    """使用云 API 批量请求处理多个文本块
+    """云 API 批量多块的实验性保留接口；策略未启用 batch 时不会进入此函数。
 
-    注意：此函数保留但当前未启用。策略选择函数已禁用 batch 策略，
-    优先使用 parallel 策略以保证稳定性。
+    生产稳定路径为 parallel。
 
     Args:
         text_chunks: 文本块列表
@@ -718,16 +672,16 @@ def extract_with_batch_api(
         quiet: 安静模式
 
     Returns:
-        提取的记录列表，失败时返回 None（触发回退）
+        提取的记录列表；不适用或失败时为 ``None``（由上层选择 parallel / prompt）。
     """
     # 仅当使用云 API 且块数 > 1 时启用
+    from src.adapters.provider_env import is_langextract_openai_compatible
+
     model_type = _get_config("MODEL_TYPE", "deepseek").strip().lower()
-    is_cloud = model_type in ("deepseek", "openai", "qwen")
+    is_cloud = is_langextract_openai_compatible(model_type)
 
     if not is_cloud or len(text_chunks) <= 1:
-        return None  # 回退到普通或并行模式
-
-    if not quiet:
+        return None
         logger.info("尝试批量请求: %s 块", len(text_chunks))
 
     # 构建批量提示词
@@ -784,7 +738,7 @@ def extract_with_batch_api(
             return None
 
     except Exception as e:
-        logger.warning("批量请求失败，回退到并行模式: %s", e)
+        logger.warning("批量请求失败，批量路径放弃: %s", e)
         return None
 
 
@@ -793,12 +747,12 @@ def get_optimal_strategy(text_chunks: List[Dict], profile: dict) -> dict:
 
     算法侧并行度使用固定保守上限；进程/网关级并发由部署与后端负责。
     """
+    from src.adapters.provider_env import is_langextract_openai_compatible
+
     total_chars = sum(len(chunk.get("text", "")) for chunk in text_chunks)
     chunk_count = len(text_chunks)
     model_type = _get_config("MODEL_TYPE", "deepseek").strip().lower()
-    is_cloud = model_type in ("deepseek", "openai", "qwen")
-
-    # 云 API：多块时最多 2 路并行；本地：最多 1 路（避免与 Ollama 单实例争抢）
+    is_cloud = is_langextract_openai_compatible(model_type)
     _cloud_parallel_cap = 2
 
     if is_cloud:

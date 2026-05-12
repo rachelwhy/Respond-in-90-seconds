@@ -174,7 +174,7 @@ A23_ENABLE_OCR=false
 ```
 
 **环境变量说明：**
-- `A23_MODEL_TYPE`: 模型类型，可选 `deepseek`、`ollama`、`openai`、`qwen`
+- `A23_MODEL_TYPE`: 模型类型，可选 `deepseek`、`ollama`、`openai`、`qwen`、`moonshot`、`zhipu`、`glm`、`baichuan`、`siliconflow`、`doubao`（后七类为 OpenAI Chat Completions 兼容，见 `src/adapters/provider_env.py` 与 `.env.example`）
 - `A23_DEEPSEEK_API_KEY`: DeepSeek API密钥（当使用DeepSeek时）
 - `A23_OLLAMA_MODEL`: Ollama模型名称，如 `qwen2.5:7b`
 - `A23_TARGET_LIMIT_SECONDS`: 运行观测/目标耗时参考（秒），**不**直接截断单次 HTTP 请求

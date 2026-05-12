@@ -1,3 +1,5 @@
+"""在语义分块与字符切片之间准备 LLM 上下文，并调度 ``run_extract_with_slicing``。"""
+
 from __future__ import annotations
 
 import logging

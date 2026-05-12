@@ -1,3 +1,5 @@
+"""从 Excel/Word 模板检测版式结构并推断 ``template_mode``、表格与字段骨架。"""
+
 from pathlib import Path
 from typing import List
 
@@ -136,7 +138,7 @@ def _detect_multi_word_table(template_path: str) -> dict:
         raise ValueError("Word 模板中没有表格")
     before_texts = _paragraphs_text_before_each_table(doc)
     if len(before_texts) != len(doc.tables):
-        # 与 doc.tables 一一对应；异常时回退为等长空串
+        # 与 doc.tables 一一对应；解析失败时用等长空串占位
         while len(before_texts) < len(doc.tables):
             before_texts.append("")
         before_texts = before_texts[: len(doc.tables)]

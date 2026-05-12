@@ -1,11 +1,6 @@
-"""
-Docling 文档解析器 - 唯一的文档解析入口
+"""Docling 版式解析实现：阅读顺序、表格结构化、按文档结构的语义分块及可选 OCR。
 
-高级功能：
-- 布局分析与阅读顺序还原
-- 表格直接提取为 pandas DataFrame
-- 语义分块（按标题/段落/表格边界）
-- 可选 OCR 支持（扫描件）
+输出 chunk 布局与 ``TextParser`` 对齐，供分块抽取共用；缓存与指标见 ``docling_parse_cache`` / ``prometheus_metrics``。
 """
 
 import logging
@@ -35,9 +30,8 @@ from src.observability.prometheus_metrics import (
 
 logger = logging.getLogger(__name__)
 
-# OCR 开关 - 简化版本（使用环境变量和config.py）
 def _get_enable_ocr() -> bool:
-    """获取OCR开关配置，使用环境变量或config.py"""
+    """读取 OCR 启用开关（环境变量或 ``src.config``）。"""
     try:
         import src.config as config_module
         if hasattr(config_module, "ENABLE_OCR"):
@@ -326,7 +320,7 @@ class DoclingParser(BaseParser):
                                 if any(v for v in row_dict.values()):
                                     raw_data.append(row_dict)
                         else:
-                            # 回退：无合并信息时按原逻辑处理
+                            # 无合并元数据时按单元格逐格展开
                             headers = [cell.text if hasattr(cell, "text") else str(cell) for cell in grid[0]]
                             for row in grid[1:]:
                                 row_dict = {}

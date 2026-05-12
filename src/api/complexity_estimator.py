@@ -1,3 +1,5 @@
+"""在上传文件落地后估算篇幅与处理耗时区间，供抽取接口返回参考。"""
+
 from __future__ import annotations
 
 import logging
@@ -151,7 +153,7 @@ async def estimate_document_complexity(
                     if suffix in (".docx", ".pdf", ".pptx", ".xlsx", ".xls"):
                         docling_paths.append(pth)
                 if total_size_mb > 3.0 or len(docling_paths) > 2:
-                    logger.info("深度估算跳过（size=%.2fMB, files=%s），回退 fast 估算", total_size_mb, len(docling_paths))
+                    logger.info("深度估算跳过（size=%.2fMB, files=%s），改用 fast 估算", total_size_mb, len(docling_paths))
                     return _fallback_estimate()
 
                 parser = DoclingParser(enable_ocr=False)

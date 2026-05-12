@@ -1,3 +1,5 @@
+"""规范化 LLM 模式并结合模型可用性探测，决定是否仅走规则抽取。"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass

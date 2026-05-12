@@ -22,7 +22,7 @@ def adaptive_docling_paragraph_cap(text_len: int) -> int:
 
 
 def adaptive_char_slice_params(text_len: int) -> Tuple[int, int, int]:
-    """字符切片回退：返回 (slice_size, overlap, direct_threshold)。
+    """无语义分块时的字符切片参数：返回 (slice_size, overlap, direct_threshold)。
 
     - direct_threshold：全文短于此则不做字符切片，整段一次模型调用；
     - slice_size / overlap：滑动窗口大小与重叠，随总长调整。

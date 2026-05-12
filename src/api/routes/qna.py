@@ -1,3 +1,5 @@
+"""HTTP：文档问答表单接口 ``/api/qna/*``。"""
+
 from __future__ import annotations
 
 from typing import List, Optional

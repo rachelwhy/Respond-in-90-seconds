@@ -1,12 +1,6 @@
-"""
-通用提取器 — 以 Docling 为唯一文档解析入口
+"""通用抽取管线：经解析器得到表格与正文，规则映射与模型补全后合并去重输出。
 
-主流程：
-1. Docling 解析文档（文本 + 表格 DataFrame）
-2. 表格数据按模板字段进行别名映射 → records
-3. 非表格文本调用 LLM 补充缺失字段
-4. 去重合并输出
-"""
+解析入口由 ``parser_factory`` 调度；本模块串联别名、模型调用与记录合并。"""
 
 import json
 import logging
@@ -245,7 +239,7 @@ class UniversalExtractor:
                 recs = self._df_to_records(df, field_names)
                 records.extend(recs)
 
-        # 回退：使用 tables_raw 中的 data 列表
+        # 无逐列映射时使用 tables_raw 中的 data 列表
         elif tables_raw:
             for table in tables_raw:
                 data = table.get("data", [])
@@ -282,7 +276,7 @@ class UniversalExtractor:
             if canonical in field_names:
                 col_mapping[col] = canonical
 
-        # 模糊映射失败时，回退到直接匹配（列名恰好等于字段名）
+        # 模糊映射未命中时，再试列名与字段名完全一致
         if not col_mapping:
             for col in df.columns:
                 col_str = str(col).strip()

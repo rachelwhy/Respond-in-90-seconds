@@ -1,4 +1,4 @@
-"""模型可用性探测（轻量、可缓存）。"""
+"""探测当前配置的模型端点是否就绪（短时缓存），供 ``llm_runtime`` 决定是否仅规则抽取。"""
 
 from __future__ import annotations
 
@@ -7,13 +7,8 @@ from typing import Dict, Optional, Tuple
 
 import requests
 
-from src.config import (
-    DEEPSEEK_API_KEY,
-    MODEL_TYPE,
-    OLLAMA_URL,
-    OPENAI_API_KEY,
-    QWEN_API_KEY,
-)
+from src.adapters.provider_env import default_chat_provider_dict, is_chat_openai_compatible
+from src.config import MODEL_TYPE, OLLAMA_URL
 
 _CACHE_TTL_SECONDS = 30.0
 _READY_CACHE: Dict[str, Tuple[float, bool, str]] = {}
@@ -45,22 +40,9 @@ def detect_model_readiness(
     ready = True
     reason = "ok"
 
-    if mt == "deepseek":
-        if not str(DEEPSEEK_API_KEY or "").strip():
-            ready = False
-            reason = "missing_deepseek_api_key"
-    elif mt == "openai":
-        if not str(OPENAI_API_KEY or "").strip():
-            ready = False
-            reason = "missing_openai_api_key"
-    elif mt == "qwen":
-        if not str(QWEN_API_KEY or "").strip():
-            ready = False
-            reason = "missing_qwen_api_key"
-    elif mt == "ollama":
+    if mt == "ollama":
         if check_ollama:
             try:
-                # OLLAMA_URL 形如 http://127.0.0.1:11434/api/generate
                 base = OLLAMA_URL.rsplit("/api/", 1)[0] if "/api/" in OLLAMA_URL else OLLAMA_URL.rstrip("/")
                 tags_url = f"{base}/api/tags"
                 resp = requests.get(tags_url, timeout=timeout_seconds)
@@ -70,6 +52,19 @@ def detect_model_readiness(
             except Exception:
                 ready = False
                 reason = "ollama_unreachable"
+    elif is_chat_openai_compatible(mt):
+        cfg = default_chat_provider_dict(mt)
+        key = str(cfg.get("api_key") or "").strip()
+        if mt == "openai" and key in ("", "not-needed"):
+            pass
+        elif not key:
+            ready = False
+            reason = f"missing_{mt}_api_key"
+        if ready and mt == "doubao":
+            base = str(cfg.get("base_url") or "").strip()
+            if not base:
+                ready = False
+                reason = "missing_doubao_base_url"
     else:
         ready = False
         reason = f"unsupported_model_type:{mt}"

@@ -1,7 +1,6 @@
-"""
-文档问答：LangChain ConversationalRetrievalChain + Chroma + HuggingFaceEmbeddings。
+"""LangChain 检索问答链：ConversationalRetrievalChain 与 Chroma、HuggingFaceEmbeddings 等集成。
 
-作为默认主路径（见 ``QNA_USE_LANGCHAIN``）；失败时由 ``qna_service`` 回退至混合检索。
+由 ``A23_QNA_USE_LANGCHAIN`` 与依赖可用性决定是否采用；未采用或链异常时由 ``qna_service`` 走混合检索路径。
 """
 
 from __future__ import annotations

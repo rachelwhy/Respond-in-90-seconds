@@ -27,7 +27,7 @@ except Exception:
 
 @functools.lru_cache(maxsize=4)
 def load_alias_map(alias_path: str = DEFAULT_ALIAS_PATH) -> dict:
-    # 默认路径：通过知识源加载（支持后续切库）；失败再回退文件读取。
+    # 默认路径：知识源加载；失败时读打包的别名 JSON 文件。
     if alias_path == DEFAULT_ALIAS_PATH:
         try:
             from src.knowledge.loader import load_knowledge_base
@@ -38,7 +38,7 @@ def load_alias_map(alias_path: str = DEFAULT_ALIAS_PATH) -> dict:
             return kb.field_aliases
         except Exception as e:
             logger.warning("通过知识源加载字段别名失败: %s", e)
-            logger.info("回退到直接文件加载")
+            logger.info("知识源不可用，从文件加载别名映射")
 
     if not os.path.exists(alias_path):
         return {}

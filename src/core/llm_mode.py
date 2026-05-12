@@ -6,14 +6,7 @@ from typing import Optional
 
 
 def normalize_llm_mode(mode: Optional[str]) -> str:
-    """将外部传入 llm_mode 规范化为 {"full","off"}。
-
-    兼容规则：
-    - None / 空字符串 -> "full"
-    - "off" -> "off"
-    - "supplement" -> "full"（历史兼容别名）
-    - 其他未知值 -> "full"
-    """
+    """将外部 ``llm_mode`` 规范为 ``full`` 或 ``off``；空值与未知值视为 ``full``，``supplement`` 映射为 ``full``。"""
     raw = (mode or "").strip().lower()
     if raw == "off":
         return "off"

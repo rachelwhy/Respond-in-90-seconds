@@ -241,7 +241,7 @@ curl -sS -X POST "http://127.0.0.1:8000/api/extract/direct" \
   - `template`（可选）
   - `input_files`（可多文件）
   - `note`（业务抽取指令）
-  - `model_type`（`ollama/openai/qwen/deepseek`）
+  - `model_type`（`ollama` / `openai` / `qwen` / `deepseek` / `moonshot` / `zhipu` / `glm` / `baichuan` / `siliconflow` / `doubao`，与 `src.config` 中 `A23_MODEL_TYPE` 一致）
   - `template_mode`（`auto/file/llm`）
   - `template_description`（`template_mode=llm` 时使用）
   - `llm_mode`（`full/off`，`supplement` 自动映射到 `full`）

@@ -1,16 +1,6 @@
-"""
-智能分块合并算法 — 解决长文档切片导致的顺序混乱与重复抽取问题
+"""跨分块记录合并：关键字段对齐、可选 rapidfuzz 相似度合并与顺序保留。
 
-核心功能：
-1. 基于关键字段的记录融合去重（增强版 merge_records_by_key）
-2. 基于内容相似度的记录合并（无关键字段时使用）
-3. 自动检测关键字段
-4. 分块位置感知合并（保留原文顺序）
-
-依赖：
-. rapidfuzz（可选，用于相似度计算）
-. 现有 merge_records_by_key 函数作为基础
-"""
+无 rapidfuzz 时仍可按键合并；用于长文档多切片结果的去重与融合。"""
 
 import json
 import logging
@@ -25,7 +15,7 @@ try:
     RAPIDFUZZ_AVAILABLE = True
 except ImportError:
     RAPIDFUZZ_AVAILABLE = False
-    logger.warning("rapidfuzz 未安装，相似度合并功能将使用回退算法")
+    logger.warning("rapidfuzz 未安装，相似度合并改用内置近似算法")
 
 
 @dataclass
@@ -336,12 +326,12 @@ class ChunkMerger:
             logger.debug(f"使用字符串相似度计算了 {n} 条记录的相似度矩阵")
             return similarity_matrix
 
-        # 如果两种方法都不可用，使用简单的文本长度相似度作为回退
-        logger.warning("无可用相似度计算方法，使用简单回退策略")
+        # rapidfuzz 不可用时，用文本长度差作为粗粒度近似
+        logger.warning("无可用相似度库，使用长度近似策略")
         for i in range(n):
             similarity_matrix[i][i] = 1.0
             for j in range(i + 1, n):
-                # 简单回退：基于文本长度的粗略相似度
+                # 长度差归一化到 0–1 的粗相似度
                 len_i, len_j = len(texts[i]), len(texts[j])
                 if len_i == 0 or len_j == 0:
                     similarity = 0.0

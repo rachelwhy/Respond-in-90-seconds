@@ -1,3 +1,7 @@
+"""生产 HTTP 入口：装配 FastAPI、CORS、上传目录过期清理与各业务路由。
+
+同步抽取主路径为 ``POST /api/extract/direct``；``/api/tasks/*`` 与入库类路由受 ``A23_ENABLE_TASKS`` 等开关约束。
+"""
 
 from __future__ import annotations
 
@@ -16,7 +20,6 @@ from src.api.routes.tasks import router as tasks_router
 from src import __version__ as APP_VERSION
 from src.api.storage_utils import cleanup_old_uploads_loop
 from src.core.runtime_env import initialize_runtime_env
-# 路由：extract（同步主路径）、tasks（可选，默认 A23_ENABLE_TASKS=false）、qna、ingest 等见 src/api/routes/。
 from src.config import (
     CORS_ALLOW_CREDENTIALS,
     CORS_ALLOW_ORIGIN_REGEX,

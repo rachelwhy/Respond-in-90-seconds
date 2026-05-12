@@ -1,3 +1,8 @@
+"""命令行与批处理入口：解析参数、生成 profile、加载输入并走抽取与模板写回。
+
+与 ``api_server`` 的 HTTP 路径并存；不落业务库，输出目录由 ``--output-dir`` 等参数指定。
+"""
+
 import argparse
 import json
 import logging
@@ -12,49 +17,46 @@ from src.core.runtime_env import initialize_runtime_env
 
 initialize_runtime_env(logger=logger, log_dotenv_loaded=True)
 
-# 导入核心服务
 from src.config import EXTRACTION_TIMEOUT
 from src.core.extraction_service import get_extraction_service
 
-# RAG：中间 JSON 读写（供 --rag-json 路径）
 def load_rag_json(filepath: str) -> dict:
-    """从路径加载 RAG 中间 JSON。"""
+    """加载 ``--rag-json`` 指向的中间 JSON 文件。"""
     import json
     with open(filepath, 'r', encoding='utf-8') as f:
         return json.load(f)
 
 def extract_retrieved_chunks_from_rag_json(rag_data: dict) -> list:
-    """返回 RAG JSON 中的 retrieved_chunks 列表。"""
+    """取 RAG 中间结果中的 ``retrieved_chunks`` 列表。"""
     return rag_data.get("retrieved_chunks", [])
 
 def preprocess_retrieved_chunks(chunks: list) -> list:
-    """对检索块做预处理；当前实现为原样返回。"""
+    """检索块预处理钩子；当前为恒等映射。"""
     return chunks
 
 def extract_structured_result_from_rag_json(rag_data: dict) -> dict:
-    """返回 RAG JSON 中的结构化结果对象。"""
+    """取 RAG 中间结果中的 ``structured_result`` 对象。"""
     return rag_data.get("structured_result", {})
 
-# 路径与输出辅助
 def ensure_parent_dir(filepath: str):
-    """确保文件父目录存在"""
+    """若缺失则创建目标文件所在目录。"""
     import os
     os.makedirs(os.path.dirname(os.path.abspath(filepath)), exist_ok=True)
 
 
 def _persist_profile_to_disk(profile_path: str, profile: dict) -> None:
-    """写出 profile（由 PERSIST_PROFILES 控制是否调用）。"""
+    """将 profile 写入磁盘；是否调用由 ``PERSIST_PROFILES`` 决定。"""
     ensure_parent_dir(profile_path)
     with open(profile_path, "w", encoding="utf-8") as f:
         json.dump(profile, f, ensure_ascii=False, indent=2)
 
 def normalize_input_path(path: str) -> str:
-    """规范化输入路径"""
+    """展开用户目录并转为绝对路径。"""
     import os
     return os.path.abspath(os.path.expanduser(path))
 
 def summarize_for_console(records: list, profile: dict) -> str:
-    """控制台用抽取条数摘要。"""
+    """控制台输出的记录条数摘要文案。"""
     return f"提取了 {len(records)} 条记录"
 
 from src.core.profile import (

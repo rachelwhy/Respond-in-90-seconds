@@ -1,3 +1,5 @@
+"""Excel/Word 模板写回：按抽取记录填充表格与纵向版式，并约定默认产物文件名。"""
+
 import re
 from copy import copy
 from pathlib import Path

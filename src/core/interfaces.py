@@ -1,9 +1,4 @@
-"""
-抽取系统统一接口定义
-
-定义核心服务接口，支持多实现（语义分块、字符切片、langextract等），
-便于依赖注入和测试。
-"""
+"""抽取服务抽象接口：约束 ``CoreExtractionService`` 等实现，便于测试与替换。"""
 
 from abc import ABC, abstractmethod
 from typing import List, Dict, Any, Optional
@@ -70,7 +65,7 @@ class IExtractionService(ABC):
                              logger=None,
                              word_table_segments: Optional[List[str]] = None,
                              routing_bundle: Optional[Dict[str, Any]] = None):
-        """使用切片模式进行抽取。优先使用 Docling 语义分块（chunks），回退到字符切片。
+        """按切片路径抽取：提供 Docling ``chunks`` 时用语义块；否则使用字符切片参数。
 
         Args:
             text: 完整文档文本

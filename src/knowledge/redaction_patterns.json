@@ -1,0 +1,27 @@
+{
+  "schema_version": 1,
+  "description": "远端模型调用前按正则替换敏感片段；占位符 ⟦A23Xn⟧ 与还原映射仅存内存。可按 id 增删改 enabled/priority。",
+  "patterns": [
+    {
+      "id": "cn_mobile",
+      "regex": "1[3-9]\\d{9}",
+      "enabled": true,
+      "priority": 100,
+      "flags": []
+    },
+    {
+      "id": "cn_id_18",
+      "regex": "\\d{17}[\\dXx]",
+      "enabled": true,
+      "priority": 90,
+      "flags": []
+    },
+    {
+      "id": "email_like",
+      "regex": "[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\\.[A-Za-z]{2,}",
+      "enabled": true,
+      "priority": 80,
+      "flags": ["IGNORECASE"]
+    }
+  ]
+}

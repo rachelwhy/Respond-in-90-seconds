@@ -1,3 +1,5 @@
+"""抽取完成后按 profile 写回 Excel/Word 及记录去重编排（CLI 与 API 共用）。"""
+
 from __future__ import annotations
 
 import logging

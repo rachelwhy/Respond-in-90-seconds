@@ -1,3 +1,5 @@
+"""模型抽取主路径编排：切片准备、Word 多表分段与调用 ``run_extract_with_slicing``。"""
+
 from __future__ import annotations
 
 import logging

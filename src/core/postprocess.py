@@ -1,3 +1,5 @@
+"""按 profile 与知识库规则清洗、校验与补缺抽取记录；必要时调用字段解释与模型辅助。"""
+
 import json
 import re
 import logging
@@ -115,7 +117,7 @@ def _build_annotation_re():
             return re.compile(rf'[（(]\s*(?:{joined})\s*[）)]')
     except Exception:
         pass
-    # 回退为空匹配模式，不替换任何内容。
+    # 无规则时使用永不匹配模式，不删除任何内容
     return re.compile(r'(?!)')
 
 _LLM_ANNOTATION_RE = _build_annotation_re()
@@ -152,7 +154,7 @@ def clean_org_name(value: str) -> str:
         if m:
             return m.group(1).strip()
 
-    # 2) 回退到后缀实体提取，优先返回句尾位置的组织名
+    # 2) 连接词模式未命中时，按后缀型组织名取句中最后一处
     suffix = r'(?:信息技术有限公司|科技有限公司|数据服务有限公司|智能设备有限公司|网络科技有限公司|软件有限公司|有限公司|集团|研究院|中心|学院|大学)'
     m_all = re.findall(r'([^\s，。、“”"（）()]{2,60}?%s)' % suffix, s)
     if m_all:
@@ -217,7 +219,7 @@ def _clean_numeric_like_value(value: Any, field_type: str) -> Any:
 def normalize_internal(value: str, field_type: str, field_name: str = "") -> str:
     """字段值规范化（类型感知）。
 
-    优先使用泛化 FieldNormalizer 规则；若无匹配规则，回退到硬编码逻辑。
+    优先走 ``FieldNormalizer`` 规则；无适用规则时用本模块内建类型处理。
     """
     # 尝试泛化规则框架
     if field_name or field_type:
@@ -233,7 +235,6 @@ def normalize_internal(value: str, field_type: str, field_name: str = "") -> str
         except Exception:
             pass
 
-    # 回退到硬编码逻辑
     field_type = (field_type or "text").lower()
 
     if field_type == "phone":
@@ -1098,7 +1099,7 @@ def process_by_profile(extracted_raw: dict, profile: dict):
                     return sv
             return ""
 
-        # 稳定排序：按「锚点字符串」在原文中首次出现位置；优先使用 profile 的 dedup_key，再回退到若干短文本列名模式
+        # 稳定排序：锚点在原文中首次出现顺序；键字段优先 profile.dedup_key，再用知识库给出的短文本锚点列名
         key_fields = profile.get("dedup_key_fields") or profile.get("key_fields") or []
         candidates = []
         if isinstance(key_fields, list) and key_fields:

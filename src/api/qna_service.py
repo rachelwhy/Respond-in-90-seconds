@@ -1,11 +1,6 @@
-"""
-文档问答服务（M1 - Q&A）
+"""文档问答：基于上传文档内容检索片段并生成回答；可选 LangChain 链或仓库内混合检索。
 
-职责边界：
-- 接收问题与文件列表，返回基于文档内容的回答
-- **默认**：LangChain ``ConversationalRetrievalChain`` + Chroma + HuggingFaceEmbeddings（``qna_langchain``）
-- **回退**：``A23_QNA_USE_LANGCHAIN=false`` 或未安装依赖 / 链失败时，使用 ``qna_retrieval.hybrid_retrieve_chunks``
-- 会话：``A23_QNA_PERSIST_SESSION``；多轮可由调用方传 ``conversation_history``
+会话文件位于 ``storage/sessions``；是否持久化由 ``A23_QNA_PERSIST_SESSION`` 与表单覆盖；LangChain 路径由 ``A23_QNA_USE_LANGCHAIN`` 与依赖可用性决定，不可用时走 ``qna_retrieval``。
 """
 
 from __future__ import annotations

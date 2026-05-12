@@ -1,3 +1,5 @@
+"""HTTP：将上传文件写入任务工作区 ``/api/ingest``（依赖任务功能开启）。"""
+
 from __future__ import annotations
 
 import json

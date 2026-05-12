@@ -314,7 +314,7 @@ def resolve_semantic_chunks_with_meta(
             scoped_table_meta.setdefault("base_chunk_count", len(base))
             return scoped_table_chunks, scoped_table_meta
 
-        # 2) 无表或表未命中：回退到语义块通用约束匹配
+        # 2) 无表或表未命中：在语义块上做通用约束匹配
         selected, meta = _select_by_constraint_set(base, constraint_set)
         if meta.get("mode") == "constraint_clauses_degraded":
             return base, meta

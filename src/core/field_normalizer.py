@@ -1,9 +1,4 @@
-"""
-泛化字段后处理框架
-
-通过 JSON 规则文件配置，支持任意字段类型的清洗、单位换算、格式化。
-优先级：字段规则 > 类型规则 > 默认规则。
-"""
+"""字段级归一化：自 ``field_normalization_rules.json`` 加载规则链，按字段/类型/默认优先级套用。"""
 
 import json
 import logging
@@ -12,8 +7,7 @@ import re
 from pathlib import Path
 from typing import Optional
 
-# 配置管理 - 简化版本（不使用ConfigManager）
-_config = None  # 不再使用ConfigManager，直接使用环境变量
+_config = None
 
 logger = logging.getLogger(__name__)
 
@@ -21,17 +15,9 @@ _DEFAULT_RULES_PATH = Path(__file__).parent.parent / "knowledge" / "field_normal
 
 
 class FieldNormalizer:
-    """基于 JSON 配置的字段规范化器。
+    """基于 JSON 配置的字段规范化器（空白清理、数字提取、单位与格式规则等按配置串联）。"""
 
-    规则链顺序：
-    1. 去空白（默认开启）
-    2. 去逗号（若配置）
-    3. 提取数字（若配置了正则）
-    4. 单位换算（若配置）
-    5. 格式化输出（若配置）
-    """
-
-    # 默认实例（用于向后兼容，但不是严格的单例）
+    # 兼容旧代码的默认实例引用
     _default_instance: Optional["FieldNormalizer"] = None
     _default_lock = None
 
@@ -123,7 +109,7 @@ class FieldNormalizer:
             field_type: 字段类型（覆盖字段规则中的 type）
 
         Returns:
-            规范化后的字符串，或 None（无法处理，调用方应回退）
+            规范化后的字符串；无法处理时为 ``None``，由调用方保留原值或走上游逻辑
         """
         if not raw_value or not isinstance(raw_value, str):
             return None

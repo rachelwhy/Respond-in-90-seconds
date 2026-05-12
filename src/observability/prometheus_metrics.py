@@ -1,6 +1,4 @@
-"""
-Prometheus 指标（可选）。未安装 prometheus_client 时为 no-op，不影响主流程。
-"""
+"""Prometheus 指标封装：未安装 ``prometheus_client`` 时为 no-op，主流程不依赖指标可用性。"""
 
 from __future__ import annotations
 

@@ -1,6 +1,4 @@
-"""
-Profile 生成器 — 从模板文件或自然语言描述生成提取配置
-"""
+"""由模板版式或描述文本生成抽取 profile（字段、类型、指令与 Word 多表约束）。"""
 
 import json
 import logging
@@ -127,7 +125,7 @@ def _enrich_fields(raw_fields: list, resolved_fields: list) -> tuple:
 
     for raw, name in zip(raw_fields, resolved_fields):
         if name in seen_names:
-            logger.warning(f"字段名重复: '{raw}' 解析为 '{name}'（已存在），回退使用原始列名")
+            logger.warning(f"字段名重复: '{raw}' 解析为 '{name}'（已存在），改用原始列名")
             name = raw
         seen_names.add(name)
 
@@ -465,7 +463,6 @@ def generate_profile_smart(
     except Exception as e:
         logger.error(f"智能 profile 生成失败: {e}")
 
-    # 回退到规则模式
     try:
         return generate_profile_from_template(template_path=template_path, mode="auto")
     except Exception:
@@ -707,12 +704,11 @@ def generate_profile_from_document(
 
     except Exception as e:
         logger.warning(f"文档自动分析失败: {e}，使用默认 profile")
-        # 回退：使用规则生成函数
         return _rule_generate_profile_and_example(sample)
 
 
 def _heuristic_profile_from_text(text: str) -> dict:
-    """简单启发式文档分析（LLM 不可用时的回退）"""
+    """无 LLM 时的轻量版式启发：根据分隔符与编号行推断表格型任务。"""
     lines = text.strip().split('\n')
     # 检测是否有表格式结构（多行相似分隔符）
     separator_lines = sum(1 for l in lines if '|' in l or '\t' in l)
@@ -937,7 +933,7 @@ def _smart_sample_document(document_text: str, total_ratio: float = 0.15) -> str
             unique_paras.append(para)
             seen.add(para)
 
-    # 5. 回退：如果采样结果为空，取前15%
+    # 5. 采样为空时取全文前 15% 字符
     if not unique_paras:
         fallback_chars = int(len(document_text) * 0.15)
         return document_text[:fallback_chars]
@@ -988,13 +984,13 @@ def _collect_paragraphs_from_end_up_to_chars(paragraphs: list, max_chars: int) -
 
 
 def _rule_generate_profile_and_example(sample_text: str) -> dict:
-    """LLM失败时的规则回退函数
+    """LLM 不可用或解析失败时，由正则与采样文本生成的最小可用 profile。
 
     Args:
         sample_text: 采样文本
 
     Returns:
-        包含fields和example的profile字典
+        包含 fields 与 example 的 profile 字典
     """
     # 正则提取 数字+单位
     pattern = r'(\d[\d,.]*)\s*([元%人万吨公里小时]*)'

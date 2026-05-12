@@ -1,12 +1,6 @@
-"""
-抽取路由（单一事实来源）
+"""抽取路由决策的唯一来源：据 profile、输入与分块元数据生成处理方式与 ``pipeline_routing`` 摘要。
 
-**职责边界（仅判断，不执行）**
-
-- 根据 profile、bundle、chunks、环境变量做 **处理方式决策** 与 **pipeline_routing 摘要**。
-- **不** 调用模型、LangExtract、HTTP；**不** 读写磁盘；**不** 修改 records / _table_groups（合并见执行层）。
-
-从「输入文件能力 → 模板类型 → 拟采用的处理链」生成 **pipeline_routing**，供 meta 观测与排障。
+纯判断层，不调用模型、不写磁盘、不修改 records；合并与执行在切片与合并模块完成。
 """
 
 from __future__ import annotations

@@ -1,3 +1,5 @@
+"""进程级启动：可选加载 ``.env``，并在导入重型库前设置 OMP/MKL 线程环境。"""
+
 from __future__ import annotations
 
 import os

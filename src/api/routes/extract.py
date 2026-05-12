@@ -1,3 +1,5 @@
+"""HTTP：同步抽取与复杂度预估（multipart 上传模板与输入）。"""
+
 from __future__ import annotations
 
 import logging

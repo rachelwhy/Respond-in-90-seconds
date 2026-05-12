@@ -1,1 +1,1 @@
-"""可观测性：指标等（可选依赖 prometheus_client）。"""
+"""可观测性子包：Prometheus 指标封装见 ``prometheus_metrics``。"""

@@ -1,9 +1,6 @@
-"""
-直接抽取服务 — 无需创建后台任务，同步返回结果
+"""同步抽取编排：在单次请求内完成 profile 解析、抽取、后处理与模板写回。
 
-职责边界：
-- 接收模板路径 + 输入目录，调用核心算法，返回 {"records": [...]} 格式
-- 不写数据库，不管文件存储，由调用方（api_server.py）处理临时目录
+输入为模板与输入目录路径；返回结构化 ``records`` 与 API 元数据。持久化上传目录由 HTTP 层管理，本模块不连接业务数据库。
 """
 
 from __future__ import annotations
@@ -85,7 +82,7 @@ def direct_extract(
         model_type: 模型类型（ollama / deepseek / openai），None 则用配置
         instruction: 补充抽取指令（可选）；若为空且 ``input_dir`` 下存在 ``用户要求.txt`` 则自动读取
         llm_mode: LLM抽取模式，可选值：'full'（默认）、'off'（纯规则）。'supplement' 会兼容映射为 'full'
-        enable_unit_aware: 是否启用单位感知（预留，暂不影响主流程）
+        enable_unit_aware: 单位感知开关（当前 profile 路径未单独分支，保留参数兼容）
         work_dir: 可选的工作空间目录（持久化场景由调用方提供，None 则无输出落盘）
         total_timeout: 总超时时间（秒），默认与 config.EXTRACTION_TIMEOUT 一致
         max_chunks: 最大语义分块数量，默认50

@@ -1,3 +1,5 @@
+"""上传目录、临时文件命名与安全清理；后台清理线程由 ``api_server`` 启动。"""
+
 from __future__ import annotations
 
 import shutil

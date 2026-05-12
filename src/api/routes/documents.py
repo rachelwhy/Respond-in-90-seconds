@@ -1,3 +1,5 @@
+"""HTTP：临时生成文件的下载与文档侧辅助接口。"""
+
 from __future__ import annotations
 
 import tempfile
